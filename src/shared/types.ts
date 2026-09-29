@@ -4,7 +4,12 @@ import type { RendererErrorReport } from './diagnostics.ts';
 import type { HooksConfig } from '../core/hooks-config.ts';
 import type { ThemeDefinition } from './themes.ts';
 import type { PetTarget, SpriteLayout } from './pets.ts';
-import type { CardChange, NewCardChange, CardRun, CardRunScope, CardRunSettings, CardSettings, PromptOverrideDetail, PromptOverrideItem, CardMeta, CardPieceImport, CardPreview, CardPreviewKind, CardPieceSummary, CardCheckReport, CardComponentResult, CardComponentSummary, CardExportResult, CardImportPreview, CardImportReport, CardLoreSuggestion, CardProjectView, CardStudioSnapshot, CardTaskInfo, CardVariableTableView, CoverSource, NewCardComponent, NewCardProject, PlanMode, SourceImportReport, SourceRecord, StartCardConversation } from './card-studio/types.ts';
+import type { GatewayUpstream } from './gateway-upstream.ts';
+import type { UsageLedgerDay } from './usage.ts';
+import type { VariableRow } from './card-studio/variable-table.ts';
+import type { RequestDiagnostic } from '../runtime/request-log.ts';
+import type { AssembledJailbreak, JailbreakChoice, JailbreakPack, JailbreakPackSummary, PresetImportEntry } from './jailbreak.ts';
+import type { CardChange, NewCardChange, CardRun, CardRunScope, CardRunSettings, CardSettings, CardSettingsChange, PromptOverrideDetail, PromptOverrideItem, CardMeta, CardPieceImport, CardPreview, CardPreviewKind, CardPieceSummary, CardCheckReport, CardComponentResult, CardComponentSummary, CardExportResult, CardImportPreview, CardImportReport, CardLoreSuggestion, CardProjectView, CardStudioSnapshot, CardTaskInfo, CardVariableTableView, CardVariableTableEdit, CardVariableSyncResult, CoverSource, NewCardComponent, NewCardProject, PlanMode, SourceImportReport, SourceRecord, StartCardConversation } from './card-studio/types.ts';
 export type PermissionMode = 'ask' | 'edit' | 'full';
 export type TaskStatus = 'idle' | 'queued' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled';
 export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -17,6 +22,12 @@ export interface GatewayModel {
 export interface Gateway {
   id: string; name: string; baseUrl: string; modelId: string;
   protocol: 'openai-completions' | 'openai-responses' | 'anthropic-messages';
+  /** 上游服务商: who serves the requests behind this address; decides which request fields are sent. Absent means 'auto'. */
+  upstream?: GatewayUpstream;
+  /** 每分钟请求上限: off unless enabled; counts retries and squad members too. */
+  rateLimit?: { enabled: boolean; perMinute: number };
+  /** How many times a failed request is retried before the run fails. */
+  retry?: { maxRetries: number };
   reasoning: boolean; contextWindow: number; maxTokens: number; hasKey: boolean;
   nativeSearch?: { enabled: boolean; responsesUrl?: string };
   effortMap?: Partial<Record<ThinkingLevel, string | null>>; adaptiveThinking?: boolean;
@@ -48,7 +59,7 @@ export interface Preferences {
   /** Set once when an older profile is opened by 0.9, which turns the animation and the sounds off. */
   quietUpgrade?: boolean;
   /** Card studio: when the app offers a new conversation (tokens, or share of the model window, whichever first). */
-  cardHandoff?: { tokens: number; windowPercent: number };
+  cardHandoff?: { tokens: number; windowPercent: number; enabled?: boolean };
   /** Card studio: shows and edits the built-in prompts (提示词覆盖). */
   developerMode?: boolean;
   /** 桌宠: off by default; the pet, when none is chosen, is the theme's; where its floating window was dragged to. */
@@ -114,6 +125,10 @@ export interface Task {
   truncation?: { outputTokens: number; maxTokens: number; model: string; turnId?: string; at: string };
   /** A section conversation of a card project; hidden from the workbench. */
   card?: CardTaskInfo;
+  /** 破限: the pack this task sends, if the user switched it on. */
+  jailbreak?: JailbreakChoice;
+  /** 请求诊断: the shape of the last model request, kept so a gateway refusal can be read. */
+  lastRequest?: RequestDiagnostic;
 }
 export interface Approval { id: string; taskId: string; toolName: string; args: Record<string, unknown>; reason: string; createdAt: string }
 export interface Schedule {
@@ -140,6 +155,10 @@ export interface AppSnapshot {
   browser?: BrowserState;
   studio?: StudioState;
   cardStudio?: CardStudioSnapshot;
+  /** Token counts of deleted tasks, so removing a conversation never rewrites a past day. */
+  usageLedger?: UsageLedgerDay[];
+  /** 每分钟请求上限: how full each limited gateway's window is right now. */
+  rateLimits?: Record<string, { used: number; limit: number; cooldown: number; waiting: number }>;
 }
 export interface NewTask {
   projectId: string; prompt?: string; title?: string; gatewayId?: string;
@@ -150,6 +169,8 @@ export interface NewTask {
   agentName?: string; squadId?: string; sharedReadOnly?: boolean; sharedWorkspace?: boolean;
   attachments?: string[];
   card?: CardTaskInfo;
+  /** 破限: the pack a new workbench task starts with. */
+  jailbreak?: JailbreakChoice;
 }
 export interface NewSchedule {
   name: string; projectId: string; prompt: string; gatewayId: string;
@@ -169,9 +190,19 @@ export interface Bridge extends StudioBridge {
   addProject(path: string): Promise<Project>;
   updateProject(id: string, changes: { name?: string; collapsed?: boolean; pinned?: boolean }): Promise<void>;
   createTask(input: NewTask): Promise<Task>;
+  /** 删除任务 / 删除对话: permanent, taking sub-tasks and squad members with it. */
+  deleteTasks(taskIds: string[]): Promise<{ deleted: number }>;
+  /** Writes a conversation to a Markdown file the user chooses; returns the path, or null if cancelled. */
+  exportTranscript(taskId: string): Promise<string | null>;
   prompt(taskId: string, text: string, behavior?: 'steer' | 'followUp', attachments?: string[]): Promise<void>;
   cancelTask(taskId: string): Promise<void>;
-  updateTask(taskId: string, changes: { title?: string; permission?: PermissionMode; gatewayId?: string; modelId?: string; contextWindow?: number; thinking?: ThinkingLevel; archived?: boolean; pinned?: boolean }): Promise<void>;
+  updateTask(taskId: string, changes: { title?: string; permission?: PermissionMode; gatewayId?: string; modelId?: string; contextWindow?: number; thinking?: ThinkingLevel; archived?: boolean; pinned?: boolean; jailbreak?: JailbreakChoice | null }): Promise<void>;
+  /** 破限: the packs available to send, built-in and imported. */
+  listJailbreakPacks(): Promise<JailbreakPackSummary[]>;
+  /** Opens a SillyTavern preset and reads its entries so the user can pick which to keep. */
+  readJailbreakPreset(): Promise<{ name: string; entries: PresetImportEntry[] } | null>;
+  saveJailbreakPack(pack: JailbreakPack): Promise<JailbreakPackSummary>;
+  removeJailbreakPack(id: string): Promise<void>;
   regenerate(taskId: string, userMessageId: string, editedText?: string): Promise<void>;
   switchRevision(taskId: string, revisionId: string): Promise<void>;
   resumeAgent(taskId: string, message: string): Promise<void>;
@@ -247,7 +278,7 @@ export interface Bridge extends StudioBridge {
   openCardFolder(projectId: string, relativePath?: string): Promise<void>;
   startCardConversation(input: StartCardConversation): Promise<Task>;
   markDispatchDone(projectId: string, dispatchId: string): Promise<void>;
-  saveCardSettings(projectId: string, changes: CardSettings): Promise<void>;
+  saveCardSettings(projectId: string, changes: CardSettingsChange): Promise<void>;
   cardPromptOverrides(): Promise<PromptOverrideItem[]>;
   readCardPromptOverride(id: string): Promise<PromptOverrideDetail>;
   saveCardPromptOverride(id: string, text: string): Promise<PromptOverrideDetail>;
@@ -295,6 +326,9 @@ export interface Bridge extends StudioBridge {
   /** AI 归类建议: one model call over up to 200 unclassified entries (these uids, else the first); suggestions only, nothing moves. */
   suggestCardLoreSections(projectId: string, uids?: number[]): Promise<CardLoreSuggestion[]>;
   readCardVariableTable(projectId: string): Promise<CardVariableTableView>;
+  /** 变量表编辑器: the rows as data, and writing them back with everything derived regenerated. */
+  readCardVariableRows(projectId: string): Promise<CardVariableTableEdit>;
+  saveCardVariableRows(projectId: string, table: { version: 1; note?: string; rows: VariableRow[] }): Promise<CardVariableSyncResult>;
   readCardPieces(projectId: string): Promise<CardPieceSummary[]>;
   runCardChecks(projectId: string): Promise<CardCheckReport>;
   exportCardProject(projectId: string, kind: 'card' | 'lorebook'): Promise<CardExportResult>;
@@ -341,6 +375,8 @@ export interface WorkerInit {
   hooks?: boolean;
   /** Workbench tasks get the built-in browser; card studio conversations do not. */
   browser?: boolean;
+  /** 破限, already resolved and with its macros expanded; absent means the toggle is off. */
+  jailbreak?: AssembledJailbreak;
 }
 export type ToWorker = WorkerInit | { type: 'prompt'; text: string; behavior?: 'steer' | 'followUp'; messageId?: string; attachments?: Array<AttachmentInfo & { storedPath: string }> }
   | { type: 'cancel' } | { type: 'permission'; permission: PermissionMode }
@@ -350,6 +386,6 @@ export type ToWorker = WorkerInit | { type: 'prompt'; text: string; behavior?: '
   | { type: 'response'; id: string; result?: unknown; error?: string };
 export type FromWorker = { type: 'ready'; sessionFile?: string; sessionLeafId?: string | null }
   | { type: 'event'; event: Record<string, unknown> }
-  | { type: 'request'; id: string; method: 'approve' | 'checkpoint' | 'network' | 'delegate' | 'team' | 'agents' | 'wait' | 'steer_agent' | 'interaction' | 'card' | 'hook' | 'browser'; args: Record<string, unknown> }
+  | { type: 'request'; id: string; method: 'approve' | 'checkpoint' | 'network' | 'rate-slot' | 'rate-cooldown' | 'delegate' | 'team' | 'agents' | 'wait' | 'steer_agent' | 'interaction' | 'card' | 'hook' | 'browser'; args: Record<string, unknown> }
   | { type: 'error'; message: string }
   | { type: 'done'; sessionFile?: string; sessionLeafId?: string | null; userEntries?: Array<{ messageId: string; entryId: string }> };

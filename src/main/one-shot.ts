@@ -1,5 +1,6 @@
 import type { Model } from '@earendil-works/pi-ai/compat';
 import { availableEfforts, effectiveEffort } from '../shared/effort.ts';
+import { upstreamCompat } from '../shared/gateway-upstream.ts';
 import type { Gateway } from '../shared/types.ts';
 
 export interface OneShotConnection { gateway: Gateway; apiKey: string }
@@ -21,7 +22,7 @@ export async function oneShotCompletion(connection: OneShotConnection, request: 
     id: gateway.modelId, name: gateway.modelId, provider: `cardwright-one-shot-${gateway.id}`, api: gateway.protocol, baseUrl: gateway.baseUrl,
     reasoning: gateway.reasoning, input: ['text'], contextWindow: gateway.contextWindow, maxTokens,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, thinkingLevelMap: { [effort.level]: effort.providerValue },
-    compat: gateway.protocol === 'anthropic-messages' ? { forceAdaptiveThinking: !!gateway.adaptiveThinking } : {},
+    compat: gateway.protocol === 'anthropic-messages' ? { forceAdaptiveThinking: !!gateway.adaptiveThinking } : upstreamCompat(gateway),
   };
   const stream = streamSimple(model, { systemPrompt: request.systemPrompt, messages: [{ role: 'user', content: request.prompt, timestamp: Date.now() }] }, {
     apiKey, maxTokens, reasoning: effort.level === 'off' ? undefined : effort.level, signal,

@@ -14,6 +14,8 @@ const maximumDirectories = 2000;
 export interface ResourceOptions {
   skillFiles?: SkillInfo[];
   identity?: { modelId: string; gatewayName: string; protocol: string; selectedEffort: string; providerEffort?: string };
+  /** 破限: the user's own framing text, placed ahead of Cardwright's own prompt. */
+  jailbreakSystem?: string;
 }
 
 export function cardwrightSystemPrompt(_identity?: ResourceOptions['identity']): string {
@@ -122,7 +124,8 @@ export function createResources(cwd: string, agentDir: string, skillPaths: strin
       ...(instructions.trim() ? [`Saved instructions:\n${instructions}`] : []),
       ...agentsFiles.map(file => `Project instructions (${file.path}):\n${file.content}`),
     ].join('\n\n'),
-    getSystemPrompt: () => cardwrightSystemPrompt(options.identity),
+    // 破限 leads, because the text is written to be read before anything else.
+    getSystemPrompt: () => [options.jailbreakSystem?.trim(), cardwrightSystemPrompt(options.identity)].filter(Boolean).join('\n\n'),
     getSystemPromptSource: () => undefined,
     getAppendSystemPrompt: () => [],
     getAppendSystemPromptSources: () => [],

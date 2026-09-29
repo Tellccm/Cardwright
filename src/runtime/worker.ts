@@ -23,6 +23,10 @@ import { loadCacheOptimizer } from './ecosystem-cache.ts';
 import { getEcosystemSkillPaths, resolveEcosystemPackage } from './ecosystem-skills.ts';
 import { BUILTIN_ROLES } from '../core/ecosystem.ts';
 import { effectiveEffort, type RuntimeEffort } from '../shared/effort.ts';
+import { upstreamCompat } from '../shared/gateway-upstream.ts';
+import { createJailbreakExtension } from './jailbreak-runtime.ts';
+import { createRateLimitExtension } from './rate-limit-runtime.ts';
+import { createRequestLogExtension } from './request-log.ts';
 import { applyConversationCursor } from './conversation-history.ts';
 import { createPromptCacheExtension } from './prompt-cache.ts';
 import { createSkillTools } from './skill-tools.ts';
@@ -213,6 +217,15 @@ export class WorkerRuntime {
   }
 
   private async initialize(init: WorkerInit): Promise<void> {
+    // 冷启动: a first run after a fresh install can sit for a long time before
+    // the first request goes out, and 1.0 never established where that time
+    // went. Each phase is timed so a slow start explains itself instead of
+    // looking like a hang. Measured on this machine, the phases below total
+    // about two seconds, so a much larger number is the environment, not this.
+    const startedAt = Date.now();
+    const phases: Array<{ name: string; ms: number }> = [];
+    let phaseAt = startedAt;
+    const phase = (name: string) => { const now = Date.now(); phases.push({ name, ms: now - phaseAt }); phaseAt = now; };
     this.init = init;
     this.planMode = Boolean(init.planMode);
     this.readOnly = Boolean(init.roleDefinition?.readOnly);
@@ -236,6 +249,7 @@ export class WorkerRuntime {
     const credentials = new InMemoryCredentialStore();
     const provider = `cardwright-${init.gateway.id}`;
     await credentials.modify(provider, async () => ({ type: 'api_key', key: init.apiKey }));
+    phase('准备目录与会话');
     const models = await ModelRuntime.create({
       credentials, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false, signal: this.initAbort.signal,
     });
@@ -244,12 +258,17 @@ export class WorkerRuntime {
     const thinkingLevelMap: Partial<Record<RuntimeEffort, string | null>> = {};
     for (const [level, value] of Object.entries(init.gateway.effortMap ?? {})) if (level !== 'ultra') thinkingLevelMap[level as RuntimeEffort] = value;
     if (effort.providerValue) thinkingLevelMap[effort.level] = effort.providerValue;
+    // 上游服务商 decides the request fields; a relay's address cannot be matched by the runtime itself.
+    const compat = {
+      ...upstreamCompat(init.gateway),
+      ...(init.gateway.adaptiveThinking ? { forceAdaptiveThinking: true } : {}),
+    };
     models.registerProvider(provider, {
       name: init.gateway.name, api: init.gateway.protocol, baseUrl: init.gateway.baseUrl, authHeader: true,
       models: [{
         id: init.gateway.modelId, name: init.gateway.modelId, reasoning: init.gateway.reasoning,
         thinkingLevelMap,
-        ...(init.gateway.adaptiveThinking ? { compat: { forceAdaptiveThinking: true } } : {}),
+        ...(Object.keys(compat).length ? { compat } : {}),
         input: ['text', 'image'], contextWindow: init.gateway.contextWindow, maxTokens: init.gateway.maxTokens,
         cost: init.gateway.pricing ? { input: init.gateway.pricing.input, output: init.gateway.pricing.output, cacheRead: init.gateway.pricing.cacheRead, cacheWrite: init.gateway.pricing.cacheWrite } : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       }],
@@ -257,6 +276,7 @@ export class WorkerRuntime {
     await models.refresh({ providers: [provider], allowNetwork: false, signal: this.initAbort.signal });
     const model = models.getModel(provider, init.gateway.modelId);
     if (!model) throw new Error('The configured gateway model could not be initialized.');
+    phase('注册模型');
     const emit = (event: Record<string, unknown>) => { if (event.type === 'workflow_plan') this.finalPlan = String(event.text || ''); this.send({ type: 'event', event }); };
     this.workflow = await createWorkflow({ cwd, emit, isPlanMode: () => this.planMode, canDelegate: init.canDelegate,
       ...(init.card ? { card: {
@@ -298,7 +318,9 @@ export class WorkerRuntime {
     let resourceLoader: ReturnType<typeof createResources> | undefined;
     tools.push(...createSkillTools(() => resourceLoader?.getSkillCatalog() ?? [], cwd, path => this.skillLoaded(path)).map(tool => this.guarded(tool, cwd)));
     const eventBus = createEventBus(); const runtime = createExtensionRuntime();
+    phase('准备工具与工作流');
     this.curated = init.ecosystem?.cacheEnabled ? await loadCacheOptimizer({ cwd, agentDir: init.agentDir, eventBus, runtime }) : { extensions: [], errors: [], runtime };
+    phase('加载缓存优化扩展');
     const piRoot = dirname(resolveEcosystemPackage('@earendil-works/pi-coding-agent'));
     const loader = await import(pathToFileURL(join(piRoot, 'dist/core/extensions/loader.js')).href) as { loadExtensionFromFactory(factory: ExtensionFactory, cwd: string, bus: typeof eventBus, extensionRuntime: ReturnType<typeof createExtensionRuntime>, path: string): Promise<LoadExtensionsResult['extensions'][number]> };
     if (init.mcpServers?.some(server => server.enabled)) {
@@ -324,7 +346,23 @@ export class WorkerRuntime {
         return definition.execute(id, args, signal, update, ctx);
       } }));
     }
-    resourceLoader = createResources(cwd, init.agentDir, [...init.skillPaths, ...getEcosystemSkillPaths()], init.instructions, this.curated, { skillFiles: init.skillFiles });
+    phase('加载 MCP 与其余扩展');
+    resourceLoader = createResources(cwd, init.agentDir, [...init.skillPaths, ...getEcosystemSkillPaths()], init.instructions, this.curated, { skillFiles: init.skillFiles, jailbreakSystem: init.jailbreak?.system });
+    phase('扫描技能');
+    // 请求诊断: what went out, so a bare 400 from a strict service can be read.
+    this.curated.extensions.push(await loader.loadExtensionFromFactory(createRequestLogExtension(diagnostic => emit({ type: 'request_diagnostic', diagnostic })), cwd, eventBus, runtime, 'cardwright:request-log'));
+    // 每分钟请求上限 is decided in the desktop process, where every worker of this gateway meets.
+    if (init.gateway.rateLimit?.enabled || init.gateway.retry) {
+      this.curated.extensions.push(await loader.loadExtensionFromFactory(createRateLimitExtension({
+        slot: signal => this.request('rate-slot', {}, signal).then(() => undefined),
+        cooldown: seconds => { void this.request('rate-cooldown', { seconds }).catch(() => undefined); },
+        notify: message => emit({ type: 'workflow_notice', level: 'warn', message }),
+      }), cwd, eventBus, runtime, 'cardwright:rate-limit'));
+    }
+    // 破限's conversational entries are placed per request, so switching the toggle leaves no trace in the session.
+    if (init.jailbreak?.opening.length || init.jailbreak?.tail) {
+      this.curated.extensions.push(await loader.loadExtensionFromFactory(createJailbreakExtension(() => init.jailbreak), cwd, eventBus, runtime, 'cardwright:jailbreak'));
+    }
     const memoryContext = this.memory?.systemContext() || '';
     const roleContext = init.card?.prompt || this.workflow.rolePrompt(init.roleDefinition);
     const taskContext = () => ({
@@ -356,7 +394,7 @@ export class WorkerRuntime {
       customTools: tools.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0), tools: [...new Set([...tools.map(tool => tool.name), ...extensionToolNames])].sort(), resourceLoader, sessionManager,
       settingsManager: SettingsManager.inMemory({
         // The SDK compacts when usage > contextWindow - reserveTokens.
-        compaction: { enabled: true, reserveTokens: Math.ceil(init.gateway.contextWindow * 0.1) }, retry: { enabled: true, maxRetries: 2, provider: { maxRetries: 0 } },
+        compaction: { enabled: true, reserveTokens: Math.ceil(init.gateway.contextWindow * 0.1) }, retry: { enabled: true, maxRetries: Math.min(10, Math.max(0, init.gateway.retry?.maxRetries ?? 2)), provider: { maxRetries: 0 } },
       }),
     });
     this.session = result.session;
@@ -382,6 +420,14 @@ export class WorkerRuntime {
     };
     if (this.cancelled) { this.session.dispose(); throw aborted(); }
     if (this.session.thinkingLevel !== effort.level) throw new Error('The model runtime rejected the configured reasoning mapping. Check this gateway’s supported effort levels.');
+    phase('建立会话');
+    const total = Date.now() - startedAt;
+    // Only worth saying when it was actually slow; the slowest phase names itself.
+    if (total >= 5000) {
+      const slowest = phases.reduce((worst, item) => item.ms > worst.ms ? item : worst, phases[0] ?? { name: '未知', ms: 0 });
+      emit({ type: 'workflow_notice', level: 'info', message: `本次启动用了 ${(total / 1000).toFixed(1)} 秒，最久的一步是「${slowest.name}」（${(slowest.ms / 1000).toFixed(1)} 秒）。首次运行通常慢一些，之后会快。` });
+    }
+    emit({ type: 'workflow_status', key: 'startup', value: total >= 5000 ? `启动 ${(total / 1000).toFixed(1)}s` : undefined });
     this.send({ type: 'ready', sessionFile: this.session.sessionFile, sessionLeafId: sessionManager.getLeafId() });
     this.send({ type: 'event', event: { type: 'thinking_level_changed', level: selectedEffort, runtimeLevel: effort.level, providerValue: effort.providerValue } });
     this.publishContextUsage();

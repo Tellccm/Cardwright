@@ -18,7 +18,7 @@ Cardwright 是面向 Windows 本地项目的 Agent 工作台：连接你自己�
 
 ### 安装
 
-从 [Releases](../../releases) 下载 `Cardwright-Setup-1.1.0.exe` 并安装。安装包没有代码签名，Windows 首次运行会提示「未知发布者」，可以选择「更多信息 → 仍要运行」。卸载时保留你的资料目录。
+从 [Releases](../../releases) 下载 `Cardwright-Setup-1.2.0.exe` 并安装。安装包没有代码签名，Windows 首次运行会提示「未知发布者」，可以选择「更多信息 → 仍要运行」。卸载时保留你的资料目录。
 
 也可以自己构建：
 
@@ -47,6 +47,13 @@ node scripts/package.mjs      # 便携版输出到 release/<版本>/Cardwright-w
 - **钩子**：按 Claude Code 的 `settings.json` 格式配置 SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、Stop、SubagentStop、Notification，可以从 Claude Code 导入并逐条试跑。
 - **对话**（工作台和制卡工坊都是）：代码块有语法高亮、语言标签和复制，长代码自动折叠；模型的思考过程边想边显示，想完折成「思考了 N 秒」；连续的同类工具调用合成一行；回复末尾有光标，新字淡入，滚动平滑跟随；表格有斑马纹，太宽时横向滚动。系统开了「减少动画」时这些都不动。
 - **新版本提醒**：每天查一次 GitHub 上的最新版本号，有新版本时在顶栏提示，点一下打开发布页；不下载、不上传任何东西，可以在「工作室设置」里关掉。
+- **上游服务商**：网关可以指明地址背后真正处理请求的服务（OpenAI、英伟达 NIM、DeepSeek、OpenRouter、智谱、Moonshot、Together、xAI、Cerebras 等）。接本地中转或轮询时自动识别会失效，指明之后就按那家服务接受的参数发送；认不出的地址只发通用参数。
+- **每分钟请求上限**：每个网关可选，默认关。任意 60 秒内算一次，这个网关下所有任务、小队成员和重试都算在内，超出的请求在本机排队，状态栏显示本分钟用了多少。服务器回 429 时整个网关按它给的时间一起暂停。重试次数也可以改。
+- **请求诊断**：请求失败时，错误卡片上可以看到实际发出的参数、工具名、各角色的消息条数、HTTP 状态和关键响应头。不含对话正文、工具参数和密钥，可以直接贴给别人看。
+- **删除对话**：左栏、任务菜单、已归档列表都能删，按住 Ctrl 或 Shift 可以多选。删除会连带子任务、小队成员、会话文件和检查点；项目文件、项目记忆和每天的 Token 统计不受影响。
+- **导出为 Markdown**：把一段对话连同思考过程和工具调用导出成一个文件。
+- **破限**：输入框旁的开关，默认关。内置一套创作前提提示词（普通 / 严格两档），也可以从酒馆预设里挑条目导入；导入的只存在本机。开启后随这个任务的每次请求一起发送。
+- **思考强度滑块**：六档强度做成一条会亮起来的星空滑轨，两端是「更快」和「更聪明」，默认档标「推荐」。打开「减少动画」时不闪。
 
 ### 内置浏览器
 
@@ -126,7 +133,7 @@ The interface stays quiet, deterministic rules are executed by the program, and 
 
 ### Install
 
-Download `Cardwright-Setup-1.1.0.exe` from [Releases](../../releases). The installer is not code-signed, so Windows shows an "unknown publisher" warning the first time; choose "More info → Run anyway". Uninstalling keeps your data directory.
+Download `Cardwright-Setup-1.2.0.exe` from [Releases](../../releases). The installer is not code-signed, so Windows shows an "unknown publisher" warning the first time; choose "More info → Run anyway". Uninstalling keeps your data directory.
 
 Or build it yourself:
 
@@ -155,6 +162,13 @@ node scripts/package.mjs      # portable output in release/<version>/Cardwright-
 - **Hooks**: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStop and Notification, configured in Claude Code's `settings.json` shape, importable from Claude Code and testable one by one.
 - **Conversation** (in the workbench and the card studio alike): code blocks are syntax-highlighted with a language label and a copy button, and long ones fold; the model's thinking shows as it happens and folds to "Thought for N s" when done; consecutive calls of the same tool fold into one row; a reply ends in a cursor while it writes, new text fades in and scrolling follows smoothly; tables are striped and scroll sideways when wide. Under reduced motion none of it moves.
 - **New version reminder**: once a day Cardwright reads the latest version number on GitHub; when there is a newer one, the top bar says so and opens the release page on a click. Nothing is downloaded or uploaded, and Studio settings can turn it off.
+- **Upstream service**: a gateway can name the service that actually answers behind its address (OpenAI, NVIDIA NIM, DeepSeek, OpenRouter, Z.ai, Moonshot, Together, xAI, Cerebras and others). A local relay or proxy defeats detection; naming the service sends the fields that service accepts, and an unrecognised address receives only widely accepted ones.
+- **Requests per minute**: optional per gateway, off by default. Counted over any rolling 60 seconds across every task, squad member and retry on that gateway; a request over the limit waits on this computer and the status line shows how full the minute is. A 429 pauses the whole gateway for as long as the service asks. The retry count is configurable too.
+- **Request diagnostic**: when a request fails, the error card shows the parameters that went out, the tool names, how many messages of each role, the HTTP status and the response headers worth reading. It holds no message text, no tool arguments and no credential, so it can be pasted into a bug report as it stands.
+- **Delete conversations**: from the session list, the task menu or the archived list, with Ctrl or Shift for several at once. Deleting takes sub-tasks, squad members, session files and checkpoints; project files, project memory and daily token totals are untouched.
+- **Export as Markdown**: a conversation, its thinking and its tool calls as one file.
+- **Framing prompts (破限)**: a toggle beside the composer, off by default. Two built-in sets, or entries imported from a SillyTavern preset; imported sets stay in your data folder. When on, they lead every request this task makes.
+- **Reasoning effort slider**: the six levels become a night sky that lights up as the level rises, labelled faster and smarter, with your default marked. It stops moving under reduced motion.
 
 ### The built-in browser
 

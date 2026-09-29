@@ -10,9 +10,10 @@ import { defaultEcosystem } from './ecosystem.ts';
 import { defaultEffortMap } from '../shared/effort.ts';
 import { gatewayModels, normalizeGatewayModels, resolveGatewayModel } from '../shared/gateway-models.ts';
 import { DEFAULT_MAX_OUTPUT_TOKENS, LEGACY_DEFAULT_MAX_OUTPUT_TOKENS } from '../shared/output-limit.ts';
+import type { TokenTotals, UsageLedgerDay } from '../shared/usage.ts';
 
-export type StoredState = Pick<AppSnapshot, 'preferences' | 'gateways' | 'projects' | 'tasks' | 'schedules' | 'search' | 'ecosystem' | 'hooks'>;
-export const STATE_SCHEMA_VERSION = 7;
+export type StoredState = Pick<AppSnapshot, 'preferences' | 'gateways' | 'projects' | 'tasks' | 'schedules' | 'search' | 'ecosystem' | 'hooks' | 'usageLedger'>;
+export const STATE_SCHEMA_VERSION = 8;
 
 export function defaultPreferences(): Preferences {
   let name = 'You';
@@ -88,7 +89,7 @@ function parseState(value: unknown): StoredState {
   // Card studio settings: the new-conversation threshold and developer mode.
   const handoff = settings.cardHandoff as unknown;
   if (isRecord(handoff) && Number.isInteger(handoff.tokens) && Number.isInteger(handoff.windowPercent) && (handoff.tokens as number) >= 10_000 && (handoff.tokens as number) <= 10_000_000 && (handoff.windowPercent as number) >= 10 && (handoff.windowPercent as number) <= 90) {
-    safePreferences.cardHandoff = { tokens: handoff.tokens as number, windowPercent: handoff.windowPercent as number };
+    safePreferences.cardHandoff = { tokens: handoff.tokens as number, windowPercent: handoff.windowPercent as number, ...(handoff.enabled === false ? { enabled: false } : {}) };
   }
   if (typeof settings.developerMode === 'boolean') safePreferences.developerMode = settings.developerMode;
   for (const key of ['notifyFinished', 'notifyApproval', 'bootSequence', 'quietUpgrade', 'releaseCheck'] as const) if (typeof settings[key] === 'boolean') safePreferences[key] = settings[key] as boolean;
@@ -98,6 +99,28 @@ function parseState(value: unknown): StoredState {
     // Hooks run the user's own commands, so anything unreadable is dropped rather than guessed at.
     hooks: parseHooks(value.hooks).hooks,
   };
+  // The usage ledger holds counts only; anything unreadable is dropped rather than guessed at.
+  if (Array.isArray(value.usageLedger)) {
+    const totals = (raw: unknown): TokenTotals | undefined => {
+      if (!isRecord(raw)) return undefined;
+      const read = (key: string) => Number.isFinite(raw[key]) && (raw[key] as number) >= 0 ? raw[key] as number : 0;
+      return { input: read('input'), output: read('output'), cacheRead: read('cacheRead'), cacheWrite: read('cacheWrite'), total: read('total') };
+    };
+    const days: UsageLedgerDay[] = [];
+    for (const entry of value.usageLedger) {
+      if (!isRecord(entry) || typeof entry.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.date)) continue;
+      const tokens = totals(entry.tokens);
+      if (!tokens) continue;
+      const models = Array.isArray(entry.models) ? entry.models.flatMap(item => {
+        if (!isRecord(item)) return [];
+        const modelTokens = totals(item.tokens);
+        if (!modelTokens) return [];
+        return [{ model: typeof item.model === 'string' ? item.model : null, tokens: modelTokens, responses: Number(item.responses) || 0, unreported: Number(item.unreported) || 0 }];
+      }) : [];
+      days.push({ date: entry.date, tokens, messages: Number(entry.messages) || 0, responses: Number(entry.responses) || 0, unreported: Number(entry.unreported) || 0, models });
+    }
+    if (days.length) result.usageLedger = days;
+  }
   if (isRecord(value.search)) {
     result.search = {
       enabled: value.search.enabled === true,

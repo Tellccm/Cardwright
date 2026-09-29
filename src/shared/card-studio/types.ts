@@ -1,3 +1,4 @@
+import type { VariableRow } from './variable-table.ts';
 /** Card studio data shared by the main process, the renderer and tests. */
 import type { PreviewSegment, RegexStep } from './preview.ts';
 
@@ -64,7 +65,12 @@ export interface CardSettings {
   kickoff?: { thinking?: CardThinking; gatewayId?: string; modelId?: string };
   /** What 一键制作 / 全部开做 last ran with. */
   run?: Partial<CardRunSettings>;
+  /** 破限: the pack every conversation of this card sends; absent means off. */
+  jailbreak?: { pack: string };
 }
+
+/** What may be saved onto a card; `jailbreak: null` is how the toggle is switched off. */
+export type CardSettingsChange = Omit<CardSettings, 'jailbreak'> & { jailbreak?: { pack: string } | null };
 
 /** 一键制作 covers one board; 全部开做 covers them all and ends with the assembly check; `change` runs one 改动单's dispatches. */
 export type CardRunScope = 'all' | 'lore' | 'script' | 'regex' | 'greet' | 'change';
@@ -164,5 +170,7 @@ export interface StartCardConversation { projectId: string; sectionId: string; t
 export interface CardVariableRowView { path: string; type: string; default: string; owner: string; when: string; note: string }
 /** The 变量表 for the section brief; `stale` means the table changed after the variable files were generated. */
 export interface CardVariableTableView { source: 'authored' | 'derived' | null; path: string; rows: CardVariableRowView[]; error?: string; stale?: boolean }
+/** The 变量表 as data, for the table editor; `derived` is offered as a starting point and is never edited in place. */
+export interface CardVariableTableEdit { source: 'authored' | 'derived' | null; path: string; rows: VariableRow[]; note?: string; error?: string }
 /** What `card_sync_variables` wrote. */
 export interface CardVariableSyncResult { rows: number; created: string[]; written: string[]; unchanged: string[] }

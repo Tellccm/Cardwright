@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Context, Model } from '@earendil-works/pi-ai/compat';
 import { effectiveEffort } from '../shared/effort.ts';
+import { upstreamCompat } from '../shared/gateway-upstream.ts';
 import type { Gateway } from '../shared/types.ts';
 import type { LabReport } from '../shared/studio-types.ts';
 
@@ -10,7 +11,9 @@ export async function labCompletion(connection: LabConnection, messages: Context
   const { streamSimple } = await import('@earendil-works/pi-ai/compat');
   const { gateway } = connection; const effort = effectiveEffort(gateway, gateway.reasoning && options.reasoning !== false ? 'medium' : 'off');
   const model: Model<any> = { id: gateway.modelId, name: gateway.modelId, provider: `cardwright-lab-${gateway.id}`, api: gateway.protocol, baseUrl: gateway.baseUrl, reasoning: gateway.reasoning, input: ['text', 'image'], contextWindow: gateway.contextWindow, maxTokens: 512,
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, thinkingLevelMap: { [effort.level]: effort.providerValue }, compat: gateway.protocol === 'anthropic-messages' ? { forceAdaptiveThinking: !!gateway.adaptiveThinking } : {} };
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, thinkingLevelMap: { [effort.level]: effort.providerValue },
+    // The connection test must send exactly what a task would, or it cannot prove the gateway works.
+    compat: gateway.protocol === 'anthropic-messages' ? { forceAdaptiveThinking: !!gateway.adaptiveThinking } : upstreamCompat(gateway) };
   const started = Date.now(); let firstTokenMs: number | null = null; let requestBytes = 0; let cacheReported = false; const probes: Promise<void>[] = [];
   const observedFetch: typeof fetch = async (input, init) => {
     const response = await fetch(input, { ...init, redirect: 'error' });

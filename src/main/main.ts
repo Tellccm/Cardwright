@@ -1,12 +1,13 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, nativeTheme, net, Notification, safeStorage, shell, Tray } from 'electron';
 import { join, resolve, sep } from 'node:path';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir, release as osRelease, version as osVersion } from 'node:os';
 import { Harness } from './harness.ts';
 import { Vault } from './vault.ts';
 import { normalizeAvatar, prepareAvatar, previewAvatarSource } from './avatars.ts';
 import { readCoverSource } from './card-cover.ts';
 import { externalUrl } from '../core/external-url.ts';
+import { readPreset } from '../shared/jailbreak.ts';
 import { setEcosystemApplicationRoot } from '../runtime/ecosystem-skills.ts';
 import type { AppSnapshot, Approval, Bridge, Task } from '../shared/types.ts';
 import type { CardPreviewKind } from '../shared/card-studio/types.ts';
@@ -63,7 +64,7 @@ async function initialize(): Promise<void> {
   const dataDirectory = app.getPath('userData');
   const logDirectory = join(dataDirectory, LOG_FOLDER);
   const vault = new Vault(dataDirectory, { encrypt: value => safeStorage.encryptString(value), decrypt: value => safeStorage.decryptString(value) });
-  harness = new Harness(dataDirectory, join(directory, 'worker.mjs'), vault, { paused: true });
+  harness = new Harness(dataDirectory, join(directory, 'worker.mjs'), vault, { paused: true, resourceRoot: join(app.getAppPath(), 'card-studio') });
   const service = harness;
   const studio = new StudioServices(dataDirectory, service, join(directory, 'Cardwright.CommandHost.exe'), buffer => {
     const value = nativeImage.createFromBuffer(buffer); if (value.isEmpty()) throw new Error('Choose a valid PNG, JPEG or WebP image.');
@@ -191,6 +192,7 @@ async function initialize(): Promise<void> {
   });
   handle('cancelTask', async id => service.cancelTask(id));
   handle('updateTask', async (id, changes) => service.updateTask(id, changes));
+  handle('deleteTasks', async ids => service.deleteTasks(ids));
   handle('approve', async (id, allow) => service.approve(id, allow));
   handle('savePreferences', async changes => service.savePreferences(changes));
   handle('uploadAvatar', async role => {
@@ -230,6 +232,19 @@ async function initialize(): Promise<void> {
   handle('pushBackup', async () => service.pushBackup());
   handle('pullBackup', async () => service.pullBackup());
   handle('openExternal', async url => { await shell.openExternal(externalUrl(url)); });
+  handle('listJailbreakPacks', async () => service.jailbreak.list());
+  handle('saveJailbreakPack', async pack => service.jailbreak.save(pack));
+  handle('removeJailbreakPack', async id => { service.jailbreak.remove(id); });
+  handle('readJailbreakPreset', async () => {
+    const selected = await dialog.showOpenDialog(window!, { title: '选择酒馆预设 / Choose a SillyTavern preset', properties: ['openFile'], filters: [{ name: '预设 / Preset', extensions: ['json'] }] });
+    if (selected.canceled || !selected.filePaths[0]) return null;
+    const raw = await readFile(selected.filePaths[0], 'utf8');
+    // A preset is a document the user chose, never a source of instructions for the app.
+    if (raw.length > 32 * 1024 * 1024) throw new Error('这个预设文件太大了。');
+    const read = readPreset(JSON.parse(raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw));
+    if (!read.entries.length) throw new Error('这个文件里没有可导入的提示词条目。');
+    return read;
+  });
   handle('saveGateway', async (gateway, key) => service.saveGateway(gateway, key));
   handle('removeGateway', async id => service.removeGateway(id));
   handle('testGateway', async id => service.testGateway(id));
@@ -243,6 +258,13 @@ async function initialize(): Promise<void> {
     return selected.canceled ? null : selected.filePaths[0];
   });
   handle('refreshSkills', async () => { service.refreshSkills(); service.emit('change', service.snapshot()); });
+  handle('exportTranscript', async taskId => {
+    const { task, markdown, suggested } = service.transcript(taskId);
+    const target = await dialog.showSaveDialog(window!, { title: `导出对话 / Export “${task.title}”`, defaultPath: suggested, filters: [{ name: 'Markdown', extensions: ['md'] }] });
+    if (target.canceled || !target.filePath) return null;
+    await writeFile(target.filePath, markdown, 'utf8');
+    return target.filePath;
+  });
   handle('exportData', async () => {
     const target = await dialog.showSaveDialog(window!, { title: 'Export Cardwright data', defaultPath: 'cardwright-export.json', filters: [{ name: 'JSON', extensions: ['json'] }] });
     if (target.canceled || !target.filePath) return null;
@@ -374,6 +396,8 @@ async function initialize(): Promise<void> {
   handle('moveCardLore', async (id, paths, section) => cardStudio.moveLore(id, paths, section));
   handle('suggestCardLoreSections', async (id, uids) => cardStudio.suggestLoreSections(id, uids));
   handle('readCardVariableTable', async id => cardStudio.readVariableTable(id));
+  handle('readCardVariableRows', async id => cardStudio.readVariableRows(id));
+  handle('saveCardVariableRows', async (id, table) => cardStudio.saveVariableRows(id, table));
   handle('readCardPieces', async id => cardStudio.listPieces(id));
   handle('runCardChecks', async id => cardStudio.runChecks(id));
   handle('exportCardProject', async (id, kind) => kind === 'lorebook' ? cardStudio.exportLorebook(id) : cardStudio.exportCard(id));

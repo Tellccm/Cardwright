@@ -9,6 +9,7 @@ import './gateway-models.css';
 import './workbench.css';
 import './hud-controls.css';
 import './pages.css';
+import './effort-slider.css';
 import './motion.css';
 import './card-studio/card-studio.css';
 import './card-studio/card-studio-section.css';

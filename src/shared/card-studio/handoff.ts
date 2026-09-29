@@ -36,8 +36,8 @@ export function formatHandoff(handoff: Handoff): string {
 }
 
 /** When the app offers a new conversation: at this many tokens, or at this share of the model window, whichever comes first. */
-export interface HandoffSettings { tokens: number; windowPercent: number }
-export const DEFAULT_HANDOFF: HandoffSettings = { tokens: 200_000, windowPercent: 50 };
+export interface HandoffSettings { tokens: number; windowPercent: number; /** false stops the app offering at all; the user changes conversations when they want to. */ enabled?: boolean }
+export const DEFAULT_HANDOFF: HandoffSettings = { tokens: 200_000, windowPercent: 50, enabled: true };
 
 export function handoffThreshold(window: number, settings: HandoffSettings = DEFAULT_HANDOFF): number {
   const share = window > 0 ? Math.floor(window * settings.windowPercent / 100) : Infinity;
@@ -52,7 +52,8 @@ export function handoffOffer(input: { tokens: number | null | undefined; window:
   const threshold = handoffThreshold(input.window, input.settings);
   const used = typeof input.tokens === 'number' && Number.isFinite(input.tokens) ? input.tokens : 0;
   const pending = !!input.handoff && input.handoff.status !== 'failed';
-  return { offer: used > 0 && used >= threshold && !input.dispatchDone && !input.active && !pending, used, threshold };
+  const offering = input.settings?.enabled !== false;
+  return { offer: offering && used > 0 && used >= threshold && !input.dispatchDone && !input.active && !pending, used, threshold };
 }
 
 /** The handoff summary the AI wrote in reply to the app's request with this message id, if it wrote one. */

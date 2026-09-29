@@ -119,6 +119,38 @@ export class CheckpointService {
     const checkpoints: Checkpoint[] = []; for (const name of names.filter(name => /^[a-f0-9-]{36}\.json$/.test(name))) { const value = await this.get(name.slice(0, -5)); if (!taskId || value.taskId === taskId) checkpoints.push(value); }
     return checkpoints.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
+  /**
+   * Drops every checkpoint of the given tasks, then reclaims the snapshot blobs
+   * no remaining checkpoint refers to. Blobs are shared by content, so they are
+   * only removed once nothing else names them.
+   */
+  async removeForTasks(taskIds: readonly string[]): Promise<void> {
+    const wanted = new Set(taskIds);
+    if (!wanted.size) return;
+    let names: string[];
+    try { names = await readdir(join(this.root, 'manifests')); } catch (error) { if (missing(error)) return; throw error; }
+    const referenced = new Set<string>();
+    let removedAny = false;
+    for (const name of names.filter(name => /^[a-f0-9-]{36}\.json$/.test(name))) {
+      const id = name.slice(0, -5);
+      let value: Manifest;
+      // A manifest that no longer parses is unusable either way; leave it alone.
+      try { value = await this.load(id); } catch { continue; }
+      if (wanted.has(value.taskId)) { await rm(this.file(id), { force: true }); removedAny = true; continue; }
+      for (const file of Object.values(value.files)) referenced.add(file.hash);
+    }
+    if (!removedAny) return;
+    let shards: string[];
+    try { shards = await readdir(join(this.root, 'blobs')); } catch (error) { if (missing(error)) return; throw error; }
+    for (const shard of shards.filter(name => /^[a-f0-9]{2}$/.test(name))) {
+      const directory = join(this.root, 'blobs', shard);
+      let blobs: string[];
+      try { blobs = await readdir(directory); } catch (error) { if (missing(error)) continue; throw error; }
+      for (const hash of blobs.filter(name => /^[a-f0-9]{64}$/.test(name))) {
+        if (!referenced.has(hash)) await rm(join(directory, hash), { force: true });
+      }
+    }
+  }
   async diff(id: string): Promise<ReviewSnapshot> {
     const checkpoint = await this.load(id); if (resolve(await rootPath(checkpoint.cwd)) !== resolve(checkpoint.cwd)) throw new Error('The checkpoint project directory changed.'); const current = await scanProject(checkpoint.cwd, { limits: this.limits, exclude: [this.root] }); const files: ReviewFile[] = [];
     const omitted = [...checkpoint.coverage.omitted, ...current.coverage.omitted];

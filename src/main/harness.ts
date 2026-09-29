@@ -11,7 +11,7 @@ import { runHooks, type HookInput, type HookOutcome } from './hooks.ts';
 import type { BrowserBridge } from './browser-bridge.ts';
 import { mergeAgents, usableAgents, type DiscoveredAgent } from '../shared/agents.ts';
 import { dirname, join, resolve } from 'node:path';
-import { realpath, stat } from 'node:fs/promises';
+import { realpath, rm, stat } from 'node:fs/promises';
 import { AppStore } from '../core/store.ts';
 import { addProjectInfo, canCreateIsolatedTasks, createWorktree, getDiff, mergeWorktree } from '../core/git.ts';
 import { evaluateSchedule, nextRunAfter } from '../core/scheduler.ts';
@@ -21,6 +21,12 @@ import { MEMORY_CATEGORIES, ProjectMemory } from '../runtime/ecosystem-memory.ts
 import { discoverSkills, skillsForProject } from '../core/skills.ts';
 import { defaultEffortMap, effectiveEffort, validateGatewayEffort } from '../shared/effort.ts';
 import { gatewayModels, normalizeGatewayModels, resolveGatewayModel } from '../shared/gateway-models.ts';
+import { isGatewayUpstream } from '../shared/gateway-upstream.ts';
+import { mergeUsageLedger, summarizeTaskUsage } from '../shared/usage.ts';
+import { buildTranscript, transcriptFileName } from '../shared/transcript.ts';
+import { JailbreakStore } from './jailbreak-store.ts';
+import { RateLimiter } from './rate-limiter.ts';
+import type { JailbreakChoice } from '../shared/jailbreak.ts';
 import { fetchModelCatalog, modelCatalogUrl, tinyCompletion } from '../core/model-catalog.ts';
 import { assertWithdrawable, selectRevision, startRevision, withdrawTurn, type Withdrawal } from '../core/conversation-revisions.ts';
 import { mapLegacyUserMessages, type ConversationEntry } from '../runtime/conversation-history.ts';
@@ -34,7 +40,7 @@ import { getEcosystemSkillPaths } from '../runtime/ecosystem-skills.ts';
 import { defaultEcosystem, extensionManifest } from '../core/ecosystem.ts';
 import { ConfigBackup, type BackupData } from './ecosystem-backup.ts';
 import type { Vault } from './vault.ts';
-import type { CardHandoffState, CardRun, CardSettings } from '../shared/card-studio/types.ts';
+import type { CardHandoffState, CardRun, CardSettings, CardSettingsChange } from '../shared/card-studio/types.ts';
 import type { AppSnapshot, AgentRole, Approval, BrowserState, EcosystemConfig, FromWorker, Gateway, GatewaySelfTest, Interaction, McpServerConfig, MemoryItem, NewSchedule, NewTask, PermissionMode, Preferences, Project, Schedule, SearchConfig, SearchOutput, SkillInfo, Task, ThinkingLevel, ToWorker } from '../shared/types.ts';
 
 const terminal = new Set(['idle', 'completed', 'failed', 'cancelled']);
@@ -60,6 +66,10 @@ export class Harness extends EventEmitter {
   private workerPath: string;
   private workers = new Map<string, Running>();
   private studio?: StudioServices;
+  /** 破限 packs: the built-in ones and whatever the user imported. */
+  readonly jailbreak: JailbreakStore;
+  /** 每分钟请求上限 and 网关冷却, shared by every worker of a gateway. */
+  readonly rateLimiter = new RateLimiter();
   private cardStudio?: CardStudioService;
   private starting = new Set<string>();
   private budgetBaselines = new Map<string, ReturnType<typeof budgetUsage>>();
@@ -88,10 +98,11 @@ export class Harness extends EventEmitter {
   private changedTimer?: ReturnType<typeof setTimeout>;
   private closing = false;
   private bootPaused = false;
-  constructor(dataDir: string, workerPath: string, vault: Vault, options: { paused?: boolean } = {}) {
+  constructor(dataDir: string, workerPath: string, vault: Vault, options: { paused?: boolean; resourceRoot?: string } = {}) {
     super();
     this.bootPaused = !!options.paused;
     this.dataDir = dataDir;
+    this.jailbreak = new JailbreakStore(dataDir, options.resourceRoot ?? join(dataDir, 'card-studio'));
     this.workerPath = workerPath;
     this.vault = vault;
     this.store = new AppStore(dataDir);
@@ -105,9 +116,19 @@ export class Harness extends EventEmitter {
     this.timer.unref();
     void this.tick();
   }
+  /** Only gateways with a limit or an active cooldown appear, so the view stays quiet otherwise. */
+  private rateLimitView(): AppSnapshot['rateLimits'] {
+    const result: NonNullable<AppSnapshot['rateLimits']> = {};
+    for (const gateway of this.store.state.gateways) {
+      const limit = gateway.rateLimit?.enabled ? gateway.rateLimit.perMinute : 0;
+      const state = this.rateLimiter.state(gateway.id, limit);
+      if (limit > 0 || state.cooldown > 0 || state.waiting > 0) result[gateway.id] = state;
+    }
+    return Object.keys(result).length ? result : undefined;
+  }
   publicView(): AppSnapshot {
     const ecosystem = { ...this.store.state.ecosystem, roles: this.roles(), mcpServers: this.store.state.ecosystem.mcpServers.map(s => ({ ...s, hasSecrets: this.vault.has(`mcp:${s.id}`) })), webdav: { ...this.store.state.ecosystem.webdav, hasPassword: this.vault.has('webdav:password') } };
-    return { ...this.store.state, storageError: this.store.lastSaveError?.message, tasks: this.store.state.tasks.map(task => ({ ...task, workerActive: this.workers.has(task.id) || this.retiring.has(task.id) || this.starting.has(task.id) })), studio: this.studio?.snapshot(), cardStudio: this.cardStudio?.snapshot(), ecosystem, extensions: extensionManifest(ecosystem, this.store.state.search), interactions: [...this.interactions.values()], search: { ...this.store.state.search, hasKey: this.vault.has('search:brave') }, gateways: this.store.state.gateways.map(g => ({ ...g, hasKey: this.vault.has(g.id) })), approvals: [...this.approvals.values()], skills: this.skills, browser: this.browserState, version: '1.1.0' };
+    return { ...this.store.state, storageError: this.store.lastSaveError?.message, tasks: this.store.state.tasks.map(task => ({ ...task, workerActive: this.workers.has(task.id) || this.retiring.has(task.id) || this.starting.has(task.id) })), studio: this.studio?.snapshot(), cardStudio: this.cardStudio?.snapshot(), ecosystem, extensions: extensionManifest(ecosystem, this.store.state.search), interactions: [...this.interactions.values()], search: { ...this.store.state.search, hasKey: this.vault.has('search:brave') }, gateways: this.store.state.gateways.map(g => ({ ...g, hasKey: this.vault.has(g.id) })), approvals: [...this.approvals.values()], skills: this.skills, browser: this.browserState, rateLimits: this.rateLimitView(), version: '1.2.0' };
   }
   snapshot(): AppSnapshot { return structuredClone(this.publicView()); }
   attachStudio(studio: StudioServices): void { this.studio = studio; }
@@ -244,6 +265,52 @@ export class Harness extends EventEmitter {
     this.changed();
     return project;
   }
+  /** A conversation as Markdown, with the project and gateway named. Credentials are redacted before anything reaches a task. */
+  transcript(taskId: string): { task: Task; markdown: string; suggested: string } {
+    const task = this.task(taskId);
+    const project = this.store.state.projects.find(item => item.id === task.projectId);
+    const gateway = this.store.state.gateways.find(item => item.id === task.gatewayId);
+    const markdown = buildTranscript(task, { chapters: task.chapters, projectName: project?.name, gatewayName: gateway?.name });
+    return { task, markdown, suggested: transcriptFileName(task.title) };
+  }
+  /**
+   * 删除任务 / 删除对话 — permanent, with no recycle bin.
+   *
+   * A task takes its sub-tasks, its squad members and its own stored records
+   * with it. The user's project files are never touched, and neither is project
+   * memory; a card's component files, dispatches and change orders stay exactly
+   * where they are. Before the records go, the tokens they account for are
+   * folded into the usage ledger, so a past day still costs what it cost.
+   */
+  async deleteTasks(ids: readonly string[]): Promise<{ deleted: number }> {
+    if (!Array.isArray(ids) || !ids.length) throw new Error('Choose at least one task to delete.');
+    const wanted = new Set(ids);
+    // Sub-tasks and squad members belong to their lead and go with it.
+    const doomed = this.store.state.tasks.filter(task => wanted.has(task.id)
+      || (task.parentId && wanted.has(task.parentId))
+      || (task.squadId && this.store.state.tasks.some(lead => wanted.has(lead.id) && lead.squadId === task.squadId)));
+    if (!doomed.length) throw new Error('These tasks are already gone.');
+    const busy = doomed.find(task => !terminal.has(task.status) || this.workers.has(task.id) || this.retiring.has(task.id) || this.starting.has(task.id));
+    if (busy) throw new Error(`Stop "${busy.title}" before deleting it.`);
+    const unmerged = doomed.find(task => task.worktree && task.delivery && task.delivery.changedFiles > 0);
+    if (unmerged) throw new Error(`"${unmerged.title}" still has changes in its own worktree that were never applied. Apply or discard them first.`);
+
+    const doomedIds = doomed.map(task => task.id);
+    this.store.state.usageLedger = mergeUsageLedger(this.store.state.usageLedger ?? [], summarizeTaskUsage(doomed));
+    this.store.state.tasks = this.store.state.tasks.filter(task => !doomedIds.includes(task.id));
+    for (const schedule of this.store.state.schedules) if (schedule.lastTaskId && doomedIds.includes(schedule.lastTaskId)) delete schedule.lastTaskId;
+    this.changed();
+
+    // The records on disk follow. A failure here loses disk space, never data
+    // the user can still see, so it must not fail the deletion itself.
+    for (const task of doomed) {
+      for (const folder of ['sessions', 'agents', 'worktrees'] as const) {
+        await rm(join(this.dataDir, folder, task.id), { recursive: true, force: true }).catch(() => undefined);
+      }
+    }
+    await this.studio?.checkpoints.removeForTasks(doomedIds).catch(() => undefined);
+    return { deleted: doomed.length };
+  }
   /** Removes the registration and its conversation records; the folder itself is never touched. */
   removeCardProject(id: string): void {
     const project = this.store.state.projects.find(item => item.id === id);
@@ -256,13 +323,19 @@ export class Harness extends EventEmitter {
     this.changed();
   }
   /** Per-card choices the card studio remembers: the permission mode new conversations start with, the kickoff effort and model. */
-  saveCardSettings(projectId: string, changes: CardSettings): void {
+  saveCardSettings(projectId: string, changes: CardSettingsChange): void {
     const project = this.store.state.projects.find(item => item.id === projectId);
     if (!project || project.kind !== 'card') throw new Error('找不到这个卡项目。');
     const next: CardSettings = { ...project.cardSettings };
     if (changes.permission !== undefined) {
       if (!permissions.has(changes.permission)) throw new Error('未知的权限模式。');
       next.permission = changes.permission;
+    }
+    if (changes.jailbreak !== undefined) {
+      // Explicitly clearing it is how the toggle turns off; an unknown pack is refused.
+      if (!changes.jailbreak) delete next.jailbreak;
+      else if (!this.jailbreak.read(changes.jailbreak.pack)) throw new Error('找不到这个破限套。');
+      else next.jailbreak = { pack: changes.jailbreak.pack };
     }
     if (changes.kickoff !== undefined) {
       const kickoff = { ...next.kickoff, ...changes.kickoff };
@@ -350,6 +423,8 @@ export class Harness extends EventEmitter {
       role: input.role || 'general-purpose', planMode: input.planMode ?? input.role === 'Plan', todos: [], runtimeStatus: {},
       agentName: input.agentName, squadId: input.squadId, sharedReadOnly: Boolean(input.parentId && input.sharedReadOnly), ...(input.parentId && input.sharedWorkspace && !input.sharedReadOnly ? { sharedWorkspace: true } : {}), assignedTask: input.parentId ? input.prompt?.slice(0, 4000) : undefined,
       ...(input.card ? { card: structuredClone(input.card) } : {}),
+      // A card's conversations follow the card's own choice, so only workbench tasks carry one.
+      ...(input.jailbreak && !input.card && this.jailbreak.read(input.jailbreak.pack) ? { jailbreak: { pack: input.jailbreak.pack } } : {}),
     };
     if (task.sharedReadOnly) { task.cwd = this.task(task.parentId!).cwd; task.role = 'Explore'; }
     if (task.sharedWorkspace) task.cwd = this.task(task.parentId!).cwd;
@@ -478,7 +553,13 @@ export class Harness extends EventEmitter {
         this.checkWaiters();
         this.pump();
       });
-      this.send(task.id, { type: 'init', squadSize: this.studio?.state.preferences.defaultSquadSize || 6, fileCheckpoints: !!this.studio, sandbox: this.studio ? { enabled: this.studio.state.preferences.sandboxEnabled, helperPath: this.studio.helperPath } : undefined, attachmentRoot: this.studio?.attachments.root, networkOrigins: this.networkOrigins(gateway), taskId: task.id, cwd: task.cwd, agentDir: join(this.dataDir, 'agents', task.id), sessionDir: join(this.dataDir, 'sessions', task.id), sessionFile: task.sessionFile, sessionLeafId: task.sessionLeafId, branchBeforeEntryId: task.branchBeforeEntryId, skillFiles: skillsForProject(this.skills, task.projectId), gateway, apiKey, thinking: task.thinking, permission: task.permission, instructions: this.store.state.preferences.instructions, skillPaths: this.store.state.preferences.skillPaths, canDelegate: !task.parentId && (!task.card || (task.card.sectionId === 'plan' && task.thinking === 'ultra')), search: { ...this.store.state.search, ...(task.card ? { enabled: !!task.card.web } : {}), hasKey: this.vault.has('search:brave'), apiKey: this.vault.get('search:brave') }, dataDir: this.dataDir, projectId: task.projectId, ecosystem: task.card ? { ...this.store.state.ecosystem, memoryEnabled: false } : this.store.state.ecosystem, mcpServers: this.store.state.ecosystem.mcpServers.map(server => ({ ...server, ...this.mcpSecrets(server.id) })), role: task.role, sharedWorkspace: !!task.sharedWorkspace, hooks: this.toolHooks(), browser: !task.card && !!this.browser, roleDefinition: task.card ? { id: 'card-section', name: sectionLabel(task.card.sectionId), prompt: '', readOnly: !!task.card.member } : task.sharedReadOnly ? { id: 'Explore', name: 'Explore', prompt: 'Read-only squad researcher. Do not modify files.', readOnly: true, builtIn: true } : usableAgents(this.roles(task.projectId), task.projectId).find(role => role.id === task.role), planMode: task.card ? false : task.planMode, todos: task.todos, ...(card ? { card } : {}) });
+      // 破限: a card's choice covers all its conversations; a workbench task keeps its own.
+      const project = this.store.state.projects.find(item => item.id === task.projectId);
+      const jailbreak = this.jailbreak.resolve(task.card ? project?.cardSettings?.jailbreak : task.jailbreak, {
+        user: this.store.state.preferences.name?.trim() || '用户',
+        char: task.card ? project?.name ?? '' : '',
+      });
+      this.send(task.id, { type: 'init', ...(jailbreak ? { jailbreak } : {}), squadSize: this.studio?.state.preferences.defaultSquadSize || 6, fileCheckpoints: !!this.studio, sandbox: this.studio ? { enabled: this.studio.state.preferences.sandboxEnabled, helperPath: this.studio.helperPath } : undefined, attachmentRoot: this.studio?.attachments.root, networkOrigins: this.networkOrigins(gateway), taskId: task.id, cwd: task.cwd, agentDir: join(this.dataDir, 'agents', task.id), sessionDir: join(this.dataDir, 'sessions', task.id), sessionFile: task.sessionFile, sessionLeafId: task.sessionLeafId, branchBeforeEntryId: task.branchBeforeEntryId, skillFiles: skillsForProject(this.skills, task.projectId), gateway, apiKey, thinking: task.thinking, permission: task.permission, instructions: this.store.state.preferences.instructions, skillPaths: this.store.state.preferences.skillPaths, canDelegate: !task.parentId && (!task.card || (task.card.sectionId === 'plan' && task.thinking === 'ultra')), search: { ...this.store.state.search, ...(task.card ? { enabled: !!task.card.web } : {}), hasKey: this.vault.has('search:brave'), apiKey: this.vault.get('search:brave') }, dataDir: this.dataDir, projectId: task.projectId, ecosystem: task.card ? { ...this.store.state.ecosystem, memoryEnabled: false } : this.store.state.ecosystem, mcpServers: this.store.state.ecosystem.mcpServers.map(server => ({ ...server, ...this.mcpSecrets(server.id) })), role: task.role, sharedWorkspace: !!task.sharedWorkspace, hooks: this.toolHooks(), browser: !task.card && !!this.browser, roleDefinition: task.card ? { id: 'card-section', name: sectionLabel(task.card.sectionId), prompt: '', readOnly: !!task.card.member } : task.sharedReadOnly ? { id: 'Explore', name: 'Explore', prompt: 'Read-only squad researcher. Do not modify files.', readOnly: true, builtIn: true } : usableAgents(this.roles(task.projectId), task.projectId).find(role => role.id === task.role), planMode: task.card ? false : task.planMode, todos: task.todos, ...(card ? { card } : {}) });
       const timeout = setTimeout(() => {
         if (!running.ready && this.workers.get(task.id) === running) { this.fail(task.id, 'Agent initialization timed out.'); child.kill(); }
       }, 45_000);
@@ -573,6 +654,8 @@ export class Harness extends EventEmitter {
     if (type === 'workflow_status') task.runtimeStatus = { ...task.runtimeStatus, [string(event.key)]: string(event.value).replace(/\x1b\[[0-9;]*m/g, '') };
     if (type === 'workflow_notice') task.messages.push({ id: randomUUID(), role: 'system', text: string(event.message).replace(/\x1b\[[0-9;]*m/g, ''), at: stamp() });
     if (type === 'workflow_compaction') task.compactions = (task.compactions || 0) + 1;
+    // 请求诊断: only the shape of the request, never its text; the error card reads it back.
+    if (type === 'request_diagnostic') { const diagnostic = object(event.diagnostic); if (diagnostic) task.lastRequest = diagnostic as unknown as Task['lastRequest']; }
     if (type === 'nested_usage') { const usage = object(event.usage); task.messages.push({ id: randomUUID(), role: 'system', text: 'Auxiliary model usage', model: string(event.model), at: stamp(), usage: { input: Number(usage.input) || 0, output: Number(usage.output) || 0, cacheRead: Number(usage.cacheRead) || 0, cacheWrite: Number(usage.cacheWrite) || 0, cost: Number(object(usage.cost).total ?? usage.cost) || 0 } }); }
     const ensureAssistant = () => {
       let id = this.streaming.get(task.id);
@@ -658,6 +741,16 @@ export class Harness extends EventEmitter {
         const phase = string(request.args.phase) === 'post' ? 'post' : 'pre';
         const outcome = await this.hooks(phase === 'pre' ? 'PreToolUse' : 'PostToolUse', task, { toolName: string(request.args.toolName), toolInput: request.args.args });
         this.respond(task.id, request.id, phase === 'pre' ? { decision: outcome.decision, reason: outcome.reason } : { reason: outcome.decision === 'deny' ? outcome.reason : undefined });
+      } else if (request.method === 'rate-slot') {
+        const gateway = this.store.state.gateways.find(item => item.id === task.gatewayId);
+        const limit = gateway?.rateLimit?.enabled ? gateway.rateLimit.perMinute : 0;
+        await this.rateLimiter.acquire(task.gatewayId, limit);
+        this.changed();
+        this.respond(task.id, request.id, true);
+      } else if (request.method === 'rate-cooldown') {
+        this.rateLimiter.cooldown(task.gatewayId, Number(request.args.seconds));
+        this.changed();
+        this.respond(task.id, request.id, true);
       } else if (request.method === 'checkpoint') {
         const turnId = string(request.args.turnId); if (!task.messages.some(message => message.id === turnId && message.role === 'user')) throw new Error('Unknown checkpoint turn.');
         await this.studio?.beforeRun(task, turnId); this.respond(task.id, request.id, true);
@@ -851,7 +944,7 @@ export class Harness extends EventEmitter {
     } else { task.status = 'cancelled'; task.completedAt = stamp(); this.checkWaiters(); }
     task.updatedAt = stamp(); this.changed(); this.pump();
   }
-  updateTask(id: string, changes: { title?: string; permission?: PermissionMode; gatewayId?: string; modelId?: string; contextWindow?: number; thinking?: ThinkingLevel; archived?: boolean; pinned?: boolean }): void {
+  updateTask(id: string, changes: { title?: string; permission?: PermissionMode; gatewayId?: string; modelId?: string; contextWindow?: number; thinking?: ThinkingLevel; archived?: boolean; pinned?: boolean; jailbreak?: JailbreakChoice | null }): void {
     const task = this.task(id);
     const selectionChanged = changes.gatewayId !== undefined || changes.modelId !== undefined || changes.contextWindow !== undefined;
     if ((selectionChanged || changes.thinking !== undefined) && !terminal.has(task.status)) throw new Error('Stop this task before changing its model, context window or reasoning level.');
@@ -859,6 +952,8 @@ export class Harness extends EventEmitter {
     if (changes.permission !== undefined && !permissions.has(changes.permission)) throw new Error('Unknown permission mode.');
     if (changes.thinking !== undefined && !levels.has(changes.thinking)) throw new Error('Unknown reasoning level.');
     for (const key of ['archived', 'pinned'] as const) if (changes[key] !== undefined && typeof changes[key] !== 'boolean') throw new Error('Invalid task state.');
+    if (changes.jailbreak && !this.jailbreak.read(changes.jailbreak.pack)) throw new Error('This 破限 pack is no longer available.');
+    if (changes.jailbreak !== undefined && !terminal.has(task.status)) throw new Error('Stop this task before changing 破限.');
     if (changes.archived !== undefined && !terminal.has(task.status)) throw new Error('Stop this task before archiving it.');
     const selected = selectionChanged ? resolveGatewayModel(this.gateway(changes.gatewayId ?? task.gatewayId), changes.modelId ?? (changes.gatewayId && changes.gatewayId !== task.gatewayId ? undefined : task.modelId), changes.contextWindow ?? task.contextWindow) : undefined;
     const next = { ...task, updatedAt: stamp() };
@@ -867,6 +962,7 @@ export class Harness extends EventEmitter {
     if (changes.thinking !== undefined) next.thinking = changes.thinking;
     if (changes.archived !== undefined) next.archived = changes.archived;
     if (changes.pinned !== undefined) next.pinned = changes.pinned;
+    if (changes.jailbreak !== undefined) { if (changes.jailbreak) next.jailbreak = { pack: changes.jailbreak.pack }; else delete next.jailbreak; }
     if (selected) { next.gatewayId = selected.id; next.modelId = selected.modelId; next.contextWindow = selected.contextWindow; next.contextUsage = undefined; next.contextCompacting = false; if (!selected.reasoning) next.thinking = 'off'; }
     const previous = { ...task };
     Object.assign(task, next);
@@ -1013,6 +1109,9 @@ export class Harness extends EventEmitter {
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('Use an HTTP(S) base URL without credentials, query or fragment.');
     if (!input.name?.trim() || input.name.length > 120 || !input.id || !/^[a-zA-Z0-9_-]{1,100}$/.test(input.id)) throw new Error('Enter a valid gateway name and identifier.');
     if (!['openai-completions', 'openai-responses', 'anthropic-messages'].includes(input.protocol)) throw new Error('Unknown API protocol.');
+    if (input.upstream !== undefined && !isGatewayUpstream(input.upstream)) throw new Error('Unknown upstream service.');
+    if (input.rateLimit !== undefined && (typeof input.rateLimit !== 'object' || !input.rateLimit || typeof input.rateLimit.enabled !== 'boolean' || !Number.isInteger(input.rateLimit.perMinute) || input.rateLimit.perMinute < 1 || input.rateLimit.perMinute > 10000)) throw new Error('Requests per minute must be a whole number between 1 and 10,000.');
+    if (input.retry !== undefined && (typeof input.retry !== 'object' || !input.retry || !Number.isInteger(input.retry.maxRetries) || input.retry.maxRetries < 0 || input.retry.maxRetries > 10)) throw new Error('Retries must be a whole number between 0 and 10.');
     if (apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.length > 8192)) throw new Error('Invalid API key.');
     const baseUrl = input.protocol === 'anthropic-messages' ? input.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '') : input.baseUrl.replace(/\/+$/, '');
     const proposed: Gateway = { ...input, baseUrl, hasKey: false, defaultsVersion: 6 };
@@ -1021,6 +1120,10 @@ export class Harness extends EventEmitter {
     if (!models.some(model => model.id === defaultId)) throw new Error('Choose a default model included in this gateway.');
     const selected = resolveGatewayModel({ ...proposed, models }, defaultId);
     const gateway: Gateway = { id: input.id, name: input.name.trim(), baseUrl, protocol: input.protocol, hasKey: false, models,
+      // 'auto' is the absent state, so an unset upstream keeps the address match.
+      ...(input.upstream && input.upstream !== 'auto' ? { upstream: input.upstream } : {}),
+      ...(input.rateLimit ? { rateLimit: { enabled: input.rateLimit.enabled, perMinute: input.rateLimit.perMinute } } : {}),
+      ...(input.retry ? { retry: { maxRetries: input.retry.maxRetries } } : {}),
       modelId: selected.modelId, reasoning: selected.reasoning, contextWindow: selected.contextWindow, maxTokens: selected.maxTokens, effortMap: selected.effortMap, adaptiveThinking: selected.adaptiveThinking, nativeSearch: selected.nativeSearch, defaultsVersion: 6 };
     for (const model of models) { const resolved = resolveGatewayModel(gateway, model.id); if (resolved.nativeSearch?.enabled) nativeSearchEndpoint(resolved); }
     const previous = this.store.state.gateways.find(item => item.id === gateway.id);

@@ -502,3 +502,29 @@
 .cs-change-files { display: grid; gap: 4px; }
 .cs-change-files .cs-link { font: 12px var(--cs-mono); }
 @media (max-width: 860px) { .cs-change { margin-left: 16px; margin-right: 16px; } }
+
+/* 思考强度 slider inside the studio's field rows. */
+.cs-field.is-slider, .cs-kickoff-field.is-slider { display: grid; gap: 6px; }
+.cs-field.is-slider .effort-slider, .cs-kickoff-field.is-slider .effort-slider { min-width: 200px; }
+.cs-chip-menu .effort-slider-card { min-width: 250px; }
+
+/* 变量表编辑器: the table of record, edited as a table. */
+.variable-table-modal { max-width: min(1080px, 94vw); }
+.variable-table-derived { margin: 10px 0 0; padding: 8px 11px; background: var(--cs-panel-2, rgba(255,255,255,.04)); border-left: 2px solid var(--accent); font-size: 12.5px; }
+.variable-table-scroll { max-height: min(50vh, 440px); overflow: auto; margin-top: 14px; border: 1px solid var(--line); }
+.variable-table-grid { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.variable-table-grid th { position: sticky; top: 0; z-index: 1; text-align: left; padding: 6px 8px; background: var(--panel-2); border-bottom: 1px solid var(--line); font-weight: 600; white-space: nowrap; }
+.variable-table-grid td { padding: 3px 5px; border-bottom: 1px solid color-mix(in srgb, var(--line) 55%, transparent); vertical-align: top; }
+.variable-table-grid input, .variable-table-grid select { width: 100%; min-width: 74px; padding: 3px 6px; font-size: 12.5px; }
+.variable-table-grid td:first-child input { font-family: var(--font-code); min-width: 150px; }
+.variable-table-number { display: flex; gap: 4px; }
+.variable-table-actions { display: flex; align-items: center; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
+.variable-table-actions small { color: var(--muted); font-size: 12px; }
+.variable-table-actions code { font-family: var(--font-code); color: var(--text); }
+.variable-table-note { display: grid; gap: 4px; margin-top: 12px; }
+.variable-table-note span { font-size: 12px; color: var(--muted); }
+.variable-table-error { margin: 12px 0 0; padding: 9px 11px; background: var(--danger-soft); color: var(--danger); font-size: 12.5px; white-space: pre-wrap; }
+.cs-vartable-actions { display: flex; gap: 14px; flex-wrap: wrap; }
+.cs-icon-button { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 3px; }
+.cs-icon-button:hover:not(:disabled) { color: var(--danger); }
+.cs-icon-button:disabled { opacity: .35; cursor: default; }

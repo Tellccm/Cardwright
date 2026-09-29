@@ -1,5 +1,6 @@
 import { useApp } from '../context';
 import { ModelPicker } from '../ModelPicker';
+import { EffortSlider } from '../EffortSlider';
 import { thinkingLabel } from '../effort';
 import { selectedModel } from '../model-resolution';
 import { availableEfforts } from '../../shared/effort';
@@ -29,11 +30,9 @@ export function KickoffOptions({ card, choice }: { card: CardProjectView; choice
   const { api, t, run } = useApp();
   const save = (kickoff: Kickoff) => void run(() => api.saveCardSettings(card.projectId, { kickoff }));
   return <div className="cs-kickoff-options">
-    <label className="cs-kickoff-field"><span>{t('Effort', '思考强度')}</span>
-      <select value={choice.thinking} disabled={!choice.ready} onChange={event => save({ thinking: event.target.value as ThinkingLevel })}>
-        {choice.efforts.map(level => <option key={level} value={level}>{thinkingLabel(level, t)}</option>)}
-      </select>
-    </label>
+    <div className="cs-kickoff-field is-slider"><span>{t('Effort', '思考强度')} · {thinkingLabel(choice.thinking, t)}</span>
+      <EffortSlider levels={choice.efforts} value={choice.thinking} disabled={!choice.ready} onChange={level => save({ thinking: level })} />
+    </div>
     <span className="cs-kickoff-field"><span>{t('Model', '模型')}</span>
       <ModelPicker gatewayId={choice.gatewayId} modelId={choice.modelId} onChange={(gatewayId, modelId) => save({ gatewayId, modelId })} />
     </span>

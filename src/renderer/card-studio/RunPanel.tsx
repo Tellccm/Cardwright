@@ -3,6 +3,7 @@ import { ArrowRight, Check, LoaderCircle, Pause, Play, Square, X, Zap } from 'lu
 import { useApp } from '../context';
 import { Modal } from '../primitives';
 import { ModelPicker } from '../ModelPicker';
+import { EffortSlider } from '../EffortSlider';
 import { thinkingLabel } from '../effort';
 import { selectedModel } from '../model-resolution';
 import { availableEfforts } from '../../shared/effort';
@@ -88,11 +89,9 @@ export function RunDialog({ card, scope, change, onClose }: { card: CardProjectV
       {queue.length > 8 && <li className="is-more">{t(`and ${queue.length - 8} more`, `还有 ${queue.length - 8} 条`)}</li>}
     </ol>}
     <div className="cs-run-fields">
-      <label className="cs-field"><span>{t('Effort', '思考强度')}</span>
-        <select value={thinking} disabled={!gateway} onChange={event => setChoice(current => ({ ...current, thinking: event.target.value as ThinkingLevel }))}>
-          {efforts.map(level => <option key={level} value={level}>{thinkingLabel(level, t)}</option>)}
-        </select>
-      </label>
+      <div className="cs-field is-slider"><span>{t('Effort', '思考强度')} · {thinkingLabel(thinking, t)}</span>
+        <EffortSlider levels={efforts} value={thinking} disabled={!gateway} onChange={level => setChoice(current => ({ ...current, thinking: level }))} />
+      </div>
       <div className="cs-field"><span>{t('Model', '模型')}</span>
         <ModelPicker gatewayId={choice.gatewayId} modelId={gateway?.modelId} onChange={(gatewayId, modelId) => setChoice(current => ({ ...current, gatewayId, modelId }))} />
       </div>

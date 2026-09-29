@@ -27,12 +27,15 @@ export function CardStudioSettings() {
   }, [api, developer, editing]);
   function save(changes: Partial<HandoffSettings>) {
     const next = { ...handoff, ...changes };
-    if (next.tokens !== handoff.tokens || next.windowPercent !== handoff.windowPercent) void run(() => api.savePreferences({ cardHandoff: next }));
+    if (next.tokens !== handoff.tokens || next.windowPercent !== handoff.windowPercent || next.enabled !== handoff.enabled) void run(() => api.savePreferences({ cardHandoff: next }));
   }
   const number = (value: string, fallback: number) => { const parsed = Number(value); return Number.isFinite(parsed) ? Math.round(parsed) : fallback; };
   return <>
     <h3 className="settings-section-title first">{t('Changing conversations', '换对话')}</h3>
     <p className="settings-intro">{t('When a section conversation reaches either threshold, the app offers a new conversation: the section AI writes a handoff summary, and the new conversation starts from it. Whichever comes first counts.', '分区对话的上下文达到任一阈值时，应用会提议换对话：先请分区 AI 写交接摘要，再带着摘要开新对话。两个阈值先到先算。')}</p>
+    <Row title={t('Offer a new conversation', '提议换对话')} description={t('Turn this off to keep one conversation going as long as you like; you can still change conversations yourself at any time.', '关掉就不再提议，一段对话可以一直用下去；你随时仍然可以自己换对话。')}>
+      <Toggle checked={handoff.enabled !== false} label={t('Offer a new conversation', '提议换对话')} onChange={value => save({ enabled: value })} />
+    </Row>
     <Row title={t('Token threshold', 'Token 阈值')} description={t('Default 200,000. From 10,000 to 10,000,000.', '默认 200,000，可设 10,000 到 10,000,000。')}>
       <input key={handoff.tokens} className="number-input is-wide" type="number" min={10_000} max={10_000_000} step={10_000} defaultValue={handoff.tokens} aria-label={t('Token threshold for a new conversation', '换对话的 Token 阈值')} onBlur={event => save({ tokens: number(event.target.value, handoff.tokens) })} />
     </Row>

@@ -35,6 +35,9 @@ async function patchJson(root: string, relative: string, change: (params: Record
 }
 
 /** The table the checks work from: the authored one when it exists (its parse errors are thrown), else a derived one. */
+/** Writes 变量表.yaml itself; the table editor is the only caller that authors it. */
+export async function writeVariableTable(root: string, text: string): Promise<void> { await writeText(root, VARIABLE_TABLE_FILE, text); }
+
 export async function readVariableTableState(root: string): Promise<VariableTableState> {
   const authored = await readText(root, VARIABLE_TABLE_FILE);
   if (authored !== null) return { source: 'authored', table: parseVariableTable(authored), text: authored };

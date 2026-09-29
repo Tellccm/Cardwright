@@ -3,6 +3,7 @@ import { Activity, Check, ChevronDown, LoaderCircle, Plus, RefreshCw, Search, St
 import type { Gateway, GatewayModel, GatewaySelfTest, ThinkingLevel } from '../shared/types';
 import { GATEWAY_PRESETS, isLoopback, type GatewayPreset } from '../shared/gateway-presets';
 import { gatewayModels } from '../shared/gateway-models';
+import { GATEWAY_UPSTREAMS, UPSTREAM_LABELS, detectUpstream, type GatewayUpstream } from '../shared/gateway-upstream';
 import { useApp } from './context';
 import { Field, IconButton, Modal } from './primitives';
 import { thinkingLabel, thinkingLevels } from './effort';
@@ -13,7 +14,11 @@ const blankModel = (id: string, name?: string): GatewayModel => ({ id, ...(name 
 
 export function GatewayEditor({ gateway, onClose }: { gateway?: Gateway; onClose: () => void }) {
   const { api, t, run } = useApp();
-  const [connection, setConnection] = useState(gateway ? { id: gateway.id, name: gateway.name, baseUrl: gateway.baseUrl, protocol: gateway.protocol } : { id: crypto.randomUUID(), name: '', baseUrl: '', protocol: 'openai-completions' as Gateway['protocol'] });
+  const [connection, setConnection] = useState(gateway
+    ? { id: gateway.id, name: gateway.name, baseUrl: gateway.baseUrl, protocol: gateway.protocol, upstream: gateway.upstream ?? 'auto' as GatewayUpstream }
+    : { id: crypto.randomUUID(), name: '', baseUrl: '', protocol: 'openai-completions' as Gateway['protocol'], upstream: 'auto' as GatewayUpstream });
+  const [rateLimit, setRateLimit] = useState(gateway?.rateLimit ?? { enabled: false, perMinute: 20 });
+  const [retries, setRetries] = useState(gateway?.retry?.maxRetries ?? 2);
   const [models, setModels] = useState<GatewayModel[]>(() => gateway ? gatewayModels(gateway).map(model => ({ ...model, effortMap: { ...defaultEffortMap, ...model.effortMap, ultra: 'max' } })) : []);
   const [defaultId, setDefaultId] = useState(gateway?.modelId || '');
   const [selectedId, setSelectedId] = useState(gateway?.modelId || '');
@@ -26,6 +31,7 @@ export function GatewayEditor({ gateway, onClose }: { gateway?: Gateway; onClose
   // Local services (本地模型, 本地代理网关) live on this computer; a model server rarely checks a key.
   const [preset, setPreset] = useState<GatewayPreset | null>(null); const [selfTest, setSelfTest] = useState<GatewaySelfTest | null>(null); const [testing, setTesting] = useState(false);
   const local = isLoopback(connection.baseUrl.trim());
+  const detected = detectUpstream(connection.baseUrl.trim());
   const validConnection = /^https?:\/\/[^\s]+$/i.test(connection.baseUrl.trim()) && (!!key.trim() || !!gateway?.hasKey || local);
   const shownCatalog = catalog.filter(model => `${model.id} ${model.name || ''}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
   const existing = new Set(models.map(model => model.id));
@@ -65,7 +71,7 @@ export function GatewayEditor({ gateway, onClose }: { gateway?: Gateway; onClose
     const selectedDefault = cleaned.find(model => model.id === defaultId) || cleaned[0]; const { id: modelId, name: _modelName, ...capabilities } = selectedDefault;
     // A local service without a key gets the placeholder “local”, which model servers accept and ignore.
     const savedKey = key || (local && !gateway?.hasKey ? 'local' : undefined);
-    const result = await run(async () => { await api.saveGateway({ ...connection, name: connection.name.trim(), baseUrl: connection.baseUrl.trim(), modelId, ...capabilities, models: cleaned }, savedKey); return true; }, t('Gateway saved', '网关已保存'));
+    const result = await run(async () => { await api.saveGateway({ ...connection, name: connection.name.trim(), baseUrl: connection.baseUrl.trim(), modelId, ...capabilities, models: cleaned, rateLimit, retry: { maxRetries: retries } }, savedKey); return true; }, t('Gateway saved', '网关已保存'));
     setBusy(false); if (result) onClose();
   }
   return <Modal title={gateway ? t('Edit gateway', '编辑网关') : t('Connect a model gateway', '连接模型网关')} onClose={() => { if (!busy) onClose(); }} className="gateway-modal gateway-multi-modal">
@@ -77,6 +83,26 @@ export function GatewayEditor({ gateway, onClose }: { gateway?: Gateway; onClose
       </section>}
       <div className="form-grid"><Field label={t('Gateway name', '网关名称')}><input autoFocus required value={connection.name} onChange={event => setConnection(current => ({ ...current, name: event.target.value }))} placeholder={t('My gateway', '我的网关')} /></Field><Field label={t('API protocol', 'API 协议')}><select value={connection.protocol} onChange={event => setConnection(current => ({ ...current, protocol: event.target.value as Gateway['protocol'] }))}><option value="openai-completions">OpenAI Chat Completions</option><option value="openai-responses">OpenAI Responses</option><option value="anthropic-messages">Anthropic Messages</option></select></Field></div>
       <div className="form-grid gateway-connection-grid"><Field label="Base URL" hint={connection.protocol === 'anthropic-messages' ? t('Service origin without /v1.', '填写不含 /v1 的服务地址。') : t('API root, usually ending in /v1.', '填写 API 根路径，通常以 /v1 结尾。')}><input type="url" required value={connection.baseUrl} onChange={event => setConnection(current => ({ ...current, baseUrl: event.target.value }))} placeholder="https://your-gateway.example/v1" spellCheck={false} /></Field><Field label="API key" hint={gateway?.hasKey ? t('Leave blank to keep the saved key.', '留空则保留已保存的密钥。') : t('Shared by all models in this gateway.', '此网关下所有模型共用此密钥。')}><input type="password" required={!gateway?.hasKey && !local} autoComplete="off" spellCheck={false} value={key} onChange={event => setKey(event.target.value)} placeholder={gateway?.hasKey ? '••••••••••••••••' : local ? t('Optional on this computer', '本机服务可以不填') : t('Enter your API key', '输入 API 密钥')} /></Field></div>
+      {connection.protocol !== 'anthropic-messages' && <Field
+        label={t('Upstream service', '上游服务商')}
+        hint={connection.upstream !== 'auto'
+          ? t('Requests carry the fields this service accepts, whatever the address looks like.', '不论地址写的是什么，都按这家服务接受的参数发送。')
+          : detected
+            ? `${t('Recognised from the address:', '已从地址识别：')} ${t(UPSTREAM_LABELS[detected].en, UPSTREAM_LABELS[detected].zh)}`
+            : t('This address is not a recognised vendor, so only widely accepted fields are sent. Behind a local relay or proxy, name the real service here.', '这个地址不是已知服务商，只发送通用参数。接本地轮询或中转时，请直接选出后面真正的服务商。')}>
+        <select value={connection.upstream} onChange={event => setConnection(current => ({ ...current, upstream: event.target.value as GatewayUpstream }))}>
+          {GATEWAY_UPSTREAMS.map(id => <option key={id} value={id}>{t(UPSTREAM_LABELS[id].en, UPSTREAM_LABELS[id].zh)}</option>)}
+        </select>
+      </Field>}
+      <details className="reasoning-capabilities gateway-traffic"><summary><span>{t('Request rate and retries', '请求速率与重试')}</span><ChevronDown size={14} /></summary>
+        <label className="checkbox-row"><input type="checkbox" checked={rateLimit.enabled} onChange={event => setRateLimit({ ...rateLimit, enabled: event.target.checked })} /><span>{t('Limit requests per minute', '限制每分钟请求数')}<small>{t('Off by default. Some services already limit you; turn this on only if yours does not, or refuses bursts.', '默认关闭。有些服务自己就有限制；只在你的服务没有、或者一多就报错时才打开。')}</small></span></label>
+        {rateLimit.enabled && <Field label={t('Requests per minute', '每分钟请求上限')} hint={t('Counted over any rolling 60 seconds, across every task, squad member and retry on this gateway. A request over the limit waits on this computer.', '按任意 60 秒计算，这个网关下所有任务、小队成员和重试都算在内。超出的请求在本机排队等待。')}>
+          <input type="number" min={1} max={10000} value={rateLimit.perMinute} onChange={event => setRateLimit({ ...rateLimit, perMinute: Math.max(1, Math.min(10000, Number(event.target.value) || 1)) })} />
+        </Field>}
+        <Field label={t('Retries after a failed request', '请求失败后的重试次数')} hint={t('Applies to timeouts, rate limits and server errors. When the service answers 429, the whole gateway pauses for as long as it asks.', '适用于超时、限流和服务器错误。服务器回 429 时，整个网关按它给的时间一起暂停。')}>
+          <input type="number" min={0} max={10} value={retries} onChange={event => setRetries(Math.max(0, Math.min(10, Number(event.target.value) || 0)))} />
+        </Field>
+      </details>
       <section className="gateway-model-section" aria-label={t('Gateway models', '网关模型')}>
         <div className="model-discovery-heading"><h3>{t('Models', '模型')} <span className="badge">{models.length}</span></h3><button type="button" className="button small" aria-expanded={catalogOpen} onClick={() => setCatalogOpen(!catalogOpen)}><Plus size={14} />{t('Add models', '添加模型')}<ChevronDown size={13} className={catalogOpen ? 'rotated' : ''} /></button></div>
         {catalogOpen && <div className="gateway-catalog">

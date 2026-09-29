@@ -1,11 +1,11 @@
 import { memo, useState } from 'react';
-import { Archive, CalendarClock, ChevronRight, FolderPlus, GalleryVerticalEnd, MoreHorizontal, Moon, Pin, Plus, Search, Settings2, Sun, X } from 'lucide-react';
+import { Archive, CalendarClock, Trash2, ChevronRight, FolderPlus, GalleryVerticalEnd, MoreHorizontal, Moon, Pin, Plus, Search, Settings2, Sun, X } from 'lucide-react';
 import type { Task } from '../shared/types';
 import { sessionGroups } from '../shared/sessions';
 import { statusText, useApp } from './context';
 import { IconButton, Mark, MenuItem, Popover } from './primitives';
 import { Avatar } from './Avatar';
-import { isMenuKey, useNavActions } from './NavActions';
+import { DeleteTasks, isMenuKey, useNavActions } from './NavActions';
 import { runIsOpen } from '../shared/card-studio/run';
 
 interface Props {
@@ -21,6 +21,10 @@ export const Sidebar = memo(function Sidebar({ mode, selectedId, onNewTask, onMo
   const { data, api, t, run, navigate, settings } = useApp();
   const [query, setQuery] = useState('');
   const [showArchived, setShowArchived] = useState(false);
+  // Ctrl/Shift-clicking a row selects instead of opening, for deleting several at once.
+  const [chosen, setChosen] = useState<string[]>([]);
+  const [deleting, setDeleting] = useState<string[] | null>(null);
+  const selecting = chosen.length > 0;
   const { openMenu, element } = useNavActions({ selectedId, onNewTask });
   const { groups, archived } = sessionGroups({ tasks: data.tasks, projects: data.projects, query });
   const theme = data.preferences.theme;
@@ -30,11 +34,12 @@ export const Sidebar = memo(function Sidebar({ mode, selectedId, onNewTask, onMo
   const making = (data.cardStudio?.cards ?? []).map(card => card.run).filter(run => runIsOpen(run));
   const makingNote = !making.length ? undefined : making.some(run => run!.status !== 'paused') ? t('One-click making', '一键制作中') : t('One-click making paused', '一键制作已暂停');
 
-  const row = (task: Task) => <div key={task.id} className={`session-row ${selectedId === task.id ? 'is-current' : ''}`}
+  function toggle(id: string) { setChosen(current => current.includes(id) ? current.filter(item => item !== id) : [...current, id]); }
+  const row = (task: Task) => <div key={task.id} className={`session-row ${selectedId === task.id ? 'is-current' : ''} ${chosen.includes(task.id) ? 'is-chosen' : ''}`}
     onContextMenu={event => { event.preventDefault(); openMenu({ kind: 'task', id: task.id }, event.currentTarget, { x: event.clientX, y: event.clientY }); }}>
     <button type="button" className="session-open" title={task.title} aria-label={task.title} aria-current={selectedId === task.id ? 'page' : undefined}
       aria-description={`${statusText(task.status, t)}${needsInput(task) ? ` · ${t('Needs your input', '需要你的回应')}` : ''}`}
-      onClick={() => navigate(task.id)}
+      onClick={event => { if (event.ctrlKey || event.metaKey || event.shiftKey || selecting) toggle(task.id); else navigate(task.id); }}
       onKeyDown={event => { if (isMenuKey(event)) { event.preventDefault(); openMenu({ kind: 'task', id: task.id }, event.currentTarget); } }}>
       {task.pinned && <Pin size={11} className="session-pin" aria-label={t('Pinned', '已置顶')} />}
       <span className="session-title">{task.title}</span>
@@ -56,6 +61,12 @@ export const Sidebar = memo(function Sidebar({ mode, selectedId, onNewTask, onMo
       <input value={query} onChange={event => setQuery(event.target.value)} placeholder={t('Search conversations…', '搜索任务…')} aria-label={t('Search conversations', '搜索任务')} />
       {query && <IconButton label={t('Clear search', '清除搜索')} onClick={() => setQuery('')}><X size={13} /></IconButton>}
     </div>
+    {selecting && <div className="session-select-bar" role="status">
+      <strong>{chosen.length}</strong>{t('selected', '项已选')}
+      <button type="button" className="text-button" onClick={() => setChosen([])}>{t('Clear', '取消选择')}</button>
+      <IconButton label={t('Delete selected', '删除所选')} onClick={() => setDeleting(chosen)}><Trash2 size={14} /></IconButton>
+    </div>}
+    {deleting && <DeleteTasks ids={deleting} onClose={() => setDeleting(null)} onDone={ids => { setDeleting(null); setChosen([]); if (selectedId && ids.includes(selectedId)) navigate(null); }} />}
     <div className="sidebar-list">
       {!data.projects.filter(project => project.kind !== 'card').length && <div className="sidebar-empty">
         <p>{t('Add a folder to begin working with your local agent.', '添加一个文件夹，开始与本地 Agent 协作。')}</p>

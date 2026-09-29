@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowLeft, ArrowRight, BookOpen, Check, FileDown, FileText, Import, LoaderCircle, Plus, Undo2 } from 'lucide-react';
+import { ArrowLeft, ArrowRight, BookOpen, Check, FileDown, FileText, Import, LoaderCircle, Plus, Table2, Trash2, Undo2 } from 'lucide-react';
 import { useApp } from '../context';
 import { boardOf, sectionLabel, sectionOf } from '../../shared/card-studio/boards';
 import { formatDispatch } from '../../shared/card-studio/dispatch';
@@ -8,6 +8,9 @@ import { conversationsOf, markableDispatch, progressInputOf, relativeTime, runni
 import type { CardComponentSummary, CardDispatch, CardPieceSummary, CardProjectView, CardVariableTableView, PlanMode } from '../../shared/card-studio/types';
 import type { Task } from '../../shared/types';
 import { useStudio } from './CardStudio';
+import { IconButton } from '../primitives';
+import { DeleteTasks } from '../NavActions';
+import { VariableTableEditor } from './VariableTableEditor';
 import { stateLabel, useNow } from './parts';
 import { AssemblyPanel } from './AssemblyPanel';
 import { PreviewPanel } from './PreviewPanel';
@@ -62,13 +65,16 @@ const VARIABLE_SECTIONS = new Set(['script-schema', 'lore-vars', 'regex-status',
 function VariableTableBrief({ card }: { card: CardProjectView }) {
   const { api, t, run } = useApp();
   const [table, setTable] = useState<CardVariableTableView | null>(null);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [reload, setReload] = useState(0);
   useEffect(() => {
     let alive = true;
     void api.readCardVariableTable(card.projectId).then(value => { if (alive) setTable(value); }, () => { if (alive) setTable(null); });
     return () => { alive = false; };
-  }, [api, card.projectId, card.updatedAt]);
+  }, [api, card.projectId, card.updatedAt, reload]);
   if (!table) return null;
   return <section className="cs-vartable">
+    {editorOpen && <VariableTableEditor projectId={card.projectId} onClose={() => { setEditorOpen(false); setReload(value => value + 1); }} />}
     <h3>{t('Variable table', '变量表')}{table.source === 'derived' && <em className="cs-badge">{t('derived', '推导的')}</em>}{table.rows.length > 0 && <em className="cs-count">{table.rows.length}</em>}</h3>
     {table.error ? <p className="cs-note is-error">{table.error}</p>
       : table.source === null ? <p className="cs-note">{t('No variable table yet; 脚本 · 变量结构 writes it.', '还没有变量表，由「脚本 · 变量结构」分区写出。')}</p>
@@ -78,8 +84,12 @@ function VariableTableBrief({ card }: { card: CardProjectView }) {
             <thead><tr><th>{t('Path', '路径')}</th><th>{t('Type', '类型')}</th><th>{t('Default', '默认')}</th><th>{t('Owner', '维护者')}</th></tr></thead>
             <tbody>{table.rows.map(row => <tr key={row.path} title={[row.note, row.when].filter(Boolean).join(' · ')}><td><code>{row.path}</code></td><td>{row.type}</td><td>{row.default}</td><td>{row.owner}</td></tr>)}</tbody>
           </table></div>
-          <button type="button" className="cs-link" onClick={() => void run(() => api.openCardFolder(card.projectId, table.path))}><FileText size={12} />{t(`Open ${table.path}`, `打开 ${table.path}`)}</button>
+          <div className="cs-vartable-actions">
+            <button type="button" className="cs-link" onClick={() => setEditorOpen(true)}><Table2 size={12} />{t('Edit the table', '编辑变量表')}</button>
+            <button type="button" className="cs-link" onClick={() => void run(() => api.openCardFolder(card.projectId, table.path))}><FileText size={12} />{t(`Open ${table.path}`, `打开 ${table.path}`)}</button>
+          </div>
         </>}
+    {table.source === null && !table.error && <button type="button" className="cs-link" onClick={() => setEditorOpen(true)}><Table2 size={12} />{t('Write one by hand', '手动写一份')}</button>}
   </section>;
 }
 
@@ -136,6 +146,7 @@ export function SectionPage({ card, sectionId, conversation }: { card: CardProje
   const now = useNow();
   const scroller = useRef<HTMLDivElement>(null);
   const [editing, setEditing] = useState(false);
+  const [deleting, setDeleting] = useState<Task | null>(null);
   const [starting, setStarting] = useState<PlanMode | null>(null);
   // The studio only navigates to sections a board has (CardStudio's openSection), so an unknown id here is a programming error.
   const board = boardOf(sectionId);
@@ -225,6 +236,7 @@ export function SectionPage({ card, sectionId, conversation }: { card: CardProje
           <i className={`cs-state st-${itemState}`} aria-hidden="true" /><span>{item.name}</span><em>{item.id === 'lore-people' && card.design.people ? `${card.design.people.written} / ${card.design.people.total}` : stateLabel(itemState, t)}</em>
         </button></li>;
       })}</ul>
+      {deleting && <DeleteTasks ids={[deleting.id]} title={deleting.title} kind="conversation" onClose={() => setDeleting(null)} onDone={ids => { setDeleting(null); if (conversation && ids.includes(conversation)) studio.openSection(card.projectId, sectionId); }} />}
       {sectionId !== 'source' && <section className="cs-rail-conversations">
         <header><span>{t('Conversations', '对话')}</span><button type="button" className="cs-link" disabled={refused} onClick={() => studio.openSection(card.projectId, sectionId, 'new')}><Plus size={13} />{t('New', '新对话')}</button></header>
         <ol>
@@ -232,7 +244,7 @@ export function SectionPage({ card, sectionId, conversation }: { card: CardProje
           {conversations.map(task => <li key={task.id}><button type="button" className={task === selected ? 'is-current' : ''} onClick={() => studio.openSection(card.projectId, sectionId, task.id)}>
             <b>{isActive(task) && <LoaderCircle size={11} className="spinning" />}{task.title}</b>
             <small>{relativeTime(task.updatedAt, now, language)}{contextPercent(task) && ` · ${t('context', '上下文')} ${contextPercent(task)}`}</small>
-          </button></li>)}
+          </button><IconButton label={`${t('Export as Markdown', '导出为 Markdown')}: ${task.title}`} className="cs-rail-delete" onClick={() => void run(async () => { const path = await api.exportTranscript(task.id); if (path) await api.openPath(path); })}><FileDown size={12} /></IconButton><IconButton label={`${t('Delete conversation', '删除对话')}: ${task.title}`} className="cs-rail-delete" disabled={isActive(task)} onClick={() => setDeleting(task)}><Trash2 size={12} /></IconButton></li>)}
           {!draft && !conversations.length && <li className="cs-rail-empty">{t('No conversations yet', '还没有对话')}</li>}
         </ol>
       </section>}

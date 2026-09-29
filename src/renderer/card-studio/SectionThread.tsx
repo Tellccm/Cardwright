@@ -297,7 +297,7 @@ export function SectionThread({ task, card, scroller }: { task: Task; card: Card
       <pre>{approval.toolName}{'\n'}{JSON.stringify(approval.args, null, 2)}</pre>
       <div className="modal-actions"><button type="button" className="cs-btn" onClick={() => void run(() => api.approve(approval.id, false))}>{t('Deny', '拒绝')}</button><button type="button" className="cs-btn is-primary" onClick={() => void run(() => api.approve(approval.id, true))}>{t('Allow once', '允许本次')}</button></div>
     </section>)}
-    {task.error && !task.truncation && !active && <RunError message={task.error} skin="studio" />}
+    {task.error && !task.truncation && !active && <RunError message={task.error} skin="studio" diagnostic={task.lastRequest} />}
     {!active && !task.error && <ConversationEnd task={task} card={card} />}
     {active && !approvals.length && <div className="cs-working"><WorkingDots />{task.status === 'queued' ? t('Queued · waiting for an agent slot', '已排队 · 等待空闲名额') : task.status === 'waiting' ? t('Waiting for your answer or approval', '等待你的回答或审批') : t('Working…', '正在处理…')}</div>}
   </div></Arrivals.Provider>;

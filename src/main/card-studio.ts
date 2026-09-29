@@ -19,8 +19,8 @@ import { frontendDocument } from '../shared/card-studio/frontend.ts';
 import type { FrontendResources } from '../shared/card-studio/frontend-compile.ts';
 import { runChecks } from '../core/card-studio/checks.ts';
 import { searchSources } from '../core/card-studio/source-search.ts';
-import { DERIVED_TABLE_FILE, VARIABLE_TABLE_FILE, hashText, readArtifactManifest, readVariableTableState, syncVariableArtifacts, writeDerivedTable } from '../core/card-studio/variable-artifacts.ts';
-import { describeVariableRow } from '../shared/card-studio/variable-table.ts';
+import { DERIVED_TABLE_FILE, VARIABLE_TABLE_FILE, hashText, readArtifactManifest, readVariableTableState, syncVariableArtifacts, writeDerivedTable, writeVariableTable } from '../core/card-studio/variable-artifacts.ts';
+import { describeVariableRow, parseVariableTable, serializeVariableTable, type VariableTable } from '../shared/card-studio/variable-table.ts';
 import { bookName, diffFingerprints, exportReport, fingerprintProject, piecesFolderName, readCardMeta, writeCardMeta, type PieceFingerprint } from '../core/card-studio/export-report.ts';
 import { isCardJson, isLorebookJson, joinComponent } from '../shared/card-studio/card-file.ts';
 import { sampleOutputFrom } from '../core/card-studio/regex.ts';
@@ -35,7 +35,7 @@ import { parseStylePreset } from '../shared/card-studio/style-presets.ts';
 import { KICKOFF, handoffRequestText, isHandoffRequest } from '../shared/card-studio/markers.ts';
 import { formatHandoff, handoffFromReply } from '../shared/card-studio/handoff.ts';
 import { changeQueue, runIsOpen, runOwns, runnableSection } from '../shared/card-studio/run.ts';
-import type { CardChange, CardChangeItem, CardCheckReport, CardComponentResult, CardComponentSummary, CardDispatch, CardExportResult, CardImportPreview, CardImportReport, CardLoreSuggestion, CardMeta, CardPieceSummary, CardPreview, CardPreviewKind, CardPreviewState, CardProjectView, CardRunSettings, CardStudioSnapshot, CardVariableSyncResult, CardVariableTableView, CoverSource, NewCardChange, NewCardComponent, NewCardProject, PlanMode, StartCardConversation } from '../shared/card-studio/types.ts';
+import type { CardChange, CardChangeItem, CardCheckReport, CardComponentResult, CardComponentSummary, CardDispatch, CardExportResult, CardImportPreview, CardImportReport, CardLoreSuggestion, CardMeta, CardPieceSummary, CardPreview, CardPreviewKind, CardPreviewState, CardProjectView, CardRunSettings, CardStudioSnapshot, CardVariableSyncResult, CardVariableTableView, CardVariableTableEdit, CoverSource, NewCardChange, NewCardComponent, NewCardProject, PlanMode, StartCardConversation } from '../shared/card-studio/types.ts';
 
 export type StartConversationInput = StartCardConversation;
 const ACTIVE = new Set(['queued', 'running', 'waiting']);
@@ -727,6 +727,34 @@ export class CardStudioService {
     } catch (error) {
       return { source: 'authored', path: VARIABLE_TABLE_FILE, rows: [], error: error instanceof Error ? error.message : String(error) };
     }
+  }
+
+  /** The rows as data, for the table editor. A derived table is offered as a starting point but is never edited in place. */
+  async readVariableRows(projectId: string): Promise<CardVariableTableEdit> {
+    const root = this.cardProject(projectId).path;
+    try {
+      const state = await readVariableTableState(root);
+      if (!state.source) return { source: null, path: VARIABLE_TABLE_FILE, rows: [] };
+      return { source: state.source, path: state.source === 'authored' ? VARIABLE_TABLE_FILE : DERIVED_TABLE_FILE, rows: state.table.rows, note: state.table.note };
+    } catch (error) {
+      return { source: 'authored', path: VARIABLE_TABLE_FILE, rows: [], error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /**
+   * Writes 变量表.yaml from the editor and regenerates everything derived from
+   * it. The table is serialized and parsed back before it lands, so an edit that
+   * would not load again is refused while the user still has it on screen.
+   */
+  async saveVariableRows(projectId: string, table: VariableTable): Promise<CardVariableSyncResult> {
+    const project = this.cardProject(projectId);
+    if (!table || table.version !== 1 || !Array.isArray(table.rows) || !table.rows.length) throw new Error('变量表至少要有一行。');
+    if (table.rows.length > 500) throw new Error('变量表最多 500 行。');
+    const text = serializeVariableTable(table);
+    // Round-trip first: the parser is the authority on what the card can load.
+    parseVariableTable(text);
+    await this.exclusive(projectId, async () => { await writeVariableTable(project.path, text); });
+    return this.syncVariables(projectId);
   }
 
   exportCard(projectId: string): Promise<CardExportResult> { return this.writeExport(projectId, 'card'); }

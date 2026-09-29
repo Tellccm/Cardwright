@@ -4,6 +4,8 @@ import { useApp } from '../context';
 import { MenuItem, Popover } from '../primitives';
 import { ContextUsage } from '../ContextUsage';
 import { ModelPicker } from '../ModelPicker';
+import { EffortSlider } from '../EffortSlider';
+import { JailbreakPicker } from '../JailbreakPicker';
 import { thinkingLabel } from '../effort';
 import { selectedModel } from '../model-resolution';
 import { playCue } from '../sound';
@@ -130,11 +132,12 @@ export function StudioComposer({ card, sectionId, task }: { card: CardProjectVie
           ? <span className="cs-chip is-on" title={t('Ultra planning sends a read-only squad to read the material.', 'Ultra 规划会派只读小队读资料。')}><Users size={13} />{t('Squad · reads', '小队 · 只读读资料')}</span>
           : <span className="cs-chip is-muted" title={t('Only Ultra planning sends a read-only squad.', '只有规划选 Ultra 时才派只读小队。')}><Users size={13} />{t('Squad · off', '小队 · 关')}</span>}
         <button type="button" className="cs-chip is-toggle" title={t('Skills and commands', '技能与命令')} onClick={() => { setText('/'); textarea.current?.focus(); }}><SquareSlash size={13} />{t('Commands', '命令')}</button>
-        <Popover label={t('Reasoning effort', '思考强度')} className="cs-chip-menu" trigger={<span className="cs-chip">{t('Effort', '思考')} · {thinkingLabel(currentThinking, t)}<ChevronDown size={12} /></span>}>{close => <>
-          <div className="menu-heading">{t('Reasoning effort', '思考强度')}</div>
-          {efforts.map(level => <MenuItem key={level} disabled={running} selected={level === currentThinking} onClick={() => { close(); void changeThinking(level); }}>{thinkingLabel(level, t)}</MenuItem>)}
+        <JailbreakPicker value={settings?.jailbreak} disabled={running} onChange={next => void run(() => api.saveCardSettings(card.projectId, { jailbreak: next }))} />
+        <Popover label={t('Reasoning effort', '思考强度')} className="cs-chip-menu" trigger={<span className="cs-chip">{t('Effort', '思考')} · {thinkingLabel(currentThinking, t)}<ChevronDown size={12} /></span>}>{() => <div className="effort-slider-card">
+          <header><strong>{thinkingLabel(currentThinking, t)}</strong></header>
+          <EffortSlider levels={efforts} value={currentThinking} disabled={running} recommended={data.preferences.defaultThinking} onChange={level => void changeThinking(level)} />
           {running && <div className="menu-footnote">{t('Change it after this run ends.', '本次执行结束后可调整。')}</div>}
-        </>}</Popover>
+        </div>}</Popover>
         {high && <span className="cs-hint">{t('High effort recommended', '建议高强度')}</span>}
         {task ? <span className="cs-model"><ModelPicker gatewayId={task.gatewayId} modelId={task.modelId} disabled={running} onChange={(gatewayId, modelId) => run(() => api.updateTask(task.id, { gatewayId, modelId }))} /></span>
           : <span className="cs-model"><ModelPicker gatewayId={draftGatewayId} modelId={gateway?.modelId} onChange={(gatewayId, modelId) => setDraftModel({ gatewayId, modelId })} /></span>}
