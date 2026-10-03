@@ -50,13 +50,39 @@ export function frontendFenceProblem(replacement: string): string | null {
     if (!DOCUMENT_START.test(content)) return '围栏里的文档没有从 <!DOCTYPE html> 开始。围栏里只放一个完整的 HTML 文档。';
     if (!DOCUMENT_END.test(content)) return '围栏里的文档没有以 </html> 结尾。结尾必须是 </html> 加闭合围栏，酒馆助手才会把它渲染成 iframe。';
     if (block.info.toLowerCase() !== 'html') return `围栏开头写的是 ${FENCE}${block.info}，要写成 ${FENCE}html。`;
-    if (content.split('\n').some(line => /^ {0,3}`{3,}\s*$/.test(line))) return '文档里有单独一行三个反引号，会让围栏提前结束，后半个文档变成消息正文。改掉这一行（例如写进 <pre> 时用 &#96;）。';
+    if (content.split('\n').some(line => /^ {0,3}`{3,}\s*$/.test(line))) return '文档里有单独一行三个反引号，会让围栏提前结束，后半个文档变成消息正文。改掉这一行（要显示三个反引号，用 JS 的 textContent 写入）。';
     return null;
   }
   if (text.includes(FENCE) && DOCUMENT_TAGS.test(text)) return '替换内容在围栏外还有文字。开头必须是 ```html，结尾必须是 </html> 加闭合围栏，前后不留别的内容。';
   if (DOCUMENT_TAGS.test(text)) return '替换内容像是一个 HTML 文档，但 <!DOCTYPE html> 之前或 </html> 之后还有文字，应用没法给它补围栏：酒馆会把它当成消息正文净化，脚本不跑、点不动。删掉文档前后的内容。';
   if (/<script(?=[\s>])/i.test(text)) return '替换内容里有 <script>，但它不是完整的 HTML 文档：酒馆会删掉脚本，点什么都没有反应。要么写成完整文档（应用会补围栏），要么去掉脚本、写成内联回执。';
   return null;
+}
+
+/** What a script writes instead of `&` (backslash, u, 0026); built from char codes so this source carries no escape sequence. */
+const UNICODE_AMP = String.fromCharCode(92) + 'u0026';
+
+export interface EscapeProblem { level: 'error' | 'warning'; code: 'frontend-entity' | 'frontend-ampersand' | 'frontend-capture' | 'frontend-macro'; message: string }
+
+/**
+ * 转义铁律, checked on the fenced document the export writes. SillyTavern decodes HTML entities in a code block one more
+ * time, so a quoted entity becomes a bare quote and the whole script stops (error). An `&` touching a letter may be read as
+ * one (warning); so may the regex replace's `$1` / `$<name>` captures and SillyTavern's `{{` macros (warnings).
+ */
+export function frontendEscapeProblems(replacement: string): EscapeProblem[] {
+  const block = fencedBlock(normalizeNewlines(replacement).trim());
+  if (!block) return [];
+  const content = block.content;
+  const problems: EscapeProblem[] = [];
+  // The ones that break code once decoded: quotes, brackets, the ampersand, the space, and every numeric reference.
+  const entity = /&(?:#\d+;?|#x[0-9a-f]+;?|(?:amp|lt|gt|quot|apos|nbsp);)/i.exec(content);
+  if (entity) problems.push({ level: 'error', code: 'frontend-entity', message: `代码里有 HTML 实体「${entity[0]}」。酒馆渲染代码块时会把实体多解码一次，写成实体的引号会变回裸引号，整段脚本跑不起来。静态文字直接写字符本身；JS 里要产出实体时把 & 写成 ${UNICODE_AMP}。` });
+  const ampersand = entity ? null : /&[a-z#]/i.exec(content);
+  if (ampersand) problems.push({ level: 'warning', code: 'frontend-ampersand', message: `代码里有 & 紧贴字母（「${ampersand[0]}」），酒馆可能把它当成实体解码。JS 的 && 和 & 两边留空格；字符串里（比如网址参数）要用 & 时写成 ${UNICODE_AMP}。` });
+  const capture = /\$(?:\d|<)/.exec(content);
+  if (capture) problems.push({ level: 'warning', code: 'frontend-capture', message: `代码里有「${capture[0]}」。酒馆会把替换内容里的 $1、$<名字> 换成正则捕获到的文字；不是故意放的捕获位就改写，例如 str.replace(re, (m, a) => a)。` });
+  if (content.includes('{{')) problems.push({ level: 'warning', code: 'frontend-macro', message: '代码里有 {{，酒馆会把它当成宏来替换；不是故意用的宏就改写。' });
+  return problems;
 }
 
 /** The document an iframe front-end renders: the inside of a fenced replacement, when that is an HTML document. */

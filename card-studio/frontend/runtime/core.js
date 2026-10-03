@@ -7,7 +7,10 @@
 (function (root) {
   'use strict';
   const VERSION = '1.1.0';
-  const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+  // 这里不写 HTML 实体：酒馆渲染代码块时会把实体多解码一次，写成实体的单引号会变回裸单引号，整段脚本语法错误。
+  // 所以 & 由字符码拼出来，源码里只有实体的名字。
+  const AMP = String.fromCharCode(38);
+  const ESCAPES = { '&': AMP + 'amp;', '<': AMP + 'lt;', '>': AMP + 'gt;', '"': AMP + 'quot;', "'": AMP + '#39;' };
   const escape = text => String(text === undefined || text === null ? '' : text).replace(/[&<>"']/g, ch => ESCAPES[ch]);
   const attr = value => escape(value).replace(/\n/g, ' ');
 

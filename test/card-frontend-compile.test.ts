@@ -9,7 +9,7 @@ import { loadFrontendResources } from '../src/core/card-studio/frontend-resource
 import { compileSheet, compress, enrichSheet, type CompileContext } from '../src/shared/card-studio/frontend-compile.ts';
 import { parseAssemblySheet, type BodySheet, type StatusSheet } from '../src/shared/card-studio/assembly-sheet.ts';
 import { parseVariableTable } from '../src/shared/card-studio/variable-table.ts';
-import { frontendQuality, isHtmlDocument } from '../src/shared/card-studio/frontend.ts';
+import { frontendEscapeProblems, frontendQuality, isHtmlDocument, withFrontendFence } from '../src/shared/card-studio/frontend.ts';
 import { STYLE_PRESETS } from '../src/shared/card-studio/style-presets.ts';
 import { BODY_SHEET, START_SHEET, STATUS_SHEET } from './assembly-sheet-samples.ts';
 import { SAMPLE_TABLE } from './variable-table-sample.ts';
@@ -33,7 +33,16 @@ test('the shipped runtime never carries what SillyTavern would substitute in a r
     assert.ok(!/\$(?:\d|<)/.test(text), `${name} contains a $-group that the regex engine would replace`);
     assert.ok(!text.includes('{{'), `${name} contains {{ which SillyTavern treats as a macro`);
     assert.ok(!/^\s*`{3}/m.test(text), `${name} contains a line of three backticks that would close the fence`);
+    assert.ok(!/&[A-Za-z#]/.test(text), `${name} contains an HTML entity (or & touching a letter) that SillyTavern decodes once more`);
   }
+});
+
+test('an HTML entity in a fenced front-end is an error; & touching a letter, $1 and {{ are warnings', () => {
+  const page = (script: string) => withFrontendFence(`<!DOCTYPE html><html><body><script>${script}</script></body></html>`);
+  assert.deepEqual(frontendEscapeProblems(page("const a = b && c; const q = 'x';")), []);
+  assert.deepEqual(frontendEscapeProblems(page("const q = '&#39;';")).map(item => `${item.level} ${item.code}`), ['error frontend-entity']);
+  assert.deepEqual(frontendEscapeProblems(page("const ok = a&&b; s.replace(re, '$1'); const m = '{{user}}';")).map(item => item.code), ['frontend-ampersand', 'frontend-capture', 'frontend-macro']);
+  assert.deepEqual(frontendEscapeProblems("<section>&amp;</section>"), [], 'an inline receipt is not a code block');
 });
 
 test('a placeholder status bar compiles into a document that passes the quality check under every skin', () => {

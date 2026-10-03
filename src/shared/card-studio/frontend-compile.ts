@@ -61,7 +61,10 @@ export function enrichSheet<T extends AssemblySheet>(sheet: T, table: VariableTa
   return { sheet, missing, invalid };
 }
 
-const escapeJson = (value: unknown): string => JSON.stringify(value).replace(/<\//g, '<\\/');
+/** A JSON escape for `&` (backslash, u, 0026), built from char codes so this source carries no escape sequence. */
+const JSON_AMP = String.fromCharCode(92) + 'u0026';
+/** Data embedded in a script: `</` cannot close the tag, and no `&` is left for SillyTavern to decode once more as an entity. */
+const escapeJson = (value: unknown): string => JSON.stringify(value).replace(/<\//g, '<\\/').replace(/&/g, JSON_AMP);
 function skinCss(resources: FrontendResources, preset: string, tokens: Record<string, string> | undefined): string {
   if (preset === 'custom') return `:root {\n${Object.entries(tokens ?? {}).map(([name, value]) => `  ${name}: ${value};`).join('\n')}\n}\n${resources.skins.custom ?? ''}`;
   return resources.skins[preset] ?? resources.skins[DEFAULT_PRESET] ?? '';

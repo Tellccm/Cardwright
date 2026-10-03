@@ -18,7 +18,7 @@ Cardwright 是面向 Windows 本地项目的 Agent 工作台：连接你自己�
 
 ### 安装
 
-从 [Releases](../../releases) 下载 `Cardwright-Setup-1.3.0.exe` 并安装。安装包没有代码签名，Windows 首次运行会提示「未知发布者」，可以选择「更多信息 → 仍要运行」。卸载时保留你的资料目录。
+从 [Releases](../../releases) 下载 `Cardwright-Setup-1.3.1.exe` 并安装。安装包没有代码签名，Windows 首次运行会提示「未知发布者」，可以选择「更多信息 → 仍要运行」。卸载时保留你的资料目录。
 
 也可以自己构建：
 
@@ -137,7 +137,7 @@ The interface stays quiet, deterministic rules are executed by the program, and 
 
 ### Install
 
-Download `Cardwright-Setup-1.3.0.exe` from [Releases](../../releases). The installer is not code-signed, so Windows shows an "unknown publisher" warning the first time; choose "More info → Run anyway". Uninstalling keeps your data directory.
+Download `Cardwright-Setup-1.3.1.exe` from [Releases](../../releases). The installer is not code-signed, so Windows shows an "unknown publisher" warning the first time; choose "More info → Run anyway". Uninstalling keeps your data directory.
 
 Or build it yourself:
 

@@ -10,7 +10,7 @@ import { readProject, WRAPPED_SECTIONS, type FileComponent, type LoreComponent, 
 import { assemblyCardName, buildCardFromCompiled, compileProject, isSheetComponent, type AssemblyContext, type CompiledProject } from './assembly.ts';
 import { backtrackSamples, createRegexProber, dialectProblems } from './regex-probe.ts';
 import { splitCard } from '../../shared/card-studio/card-file.ts';
-import { frontendDocument, frontendFenceProblem, frontendQuality } from '../../shared/card-studio/frontend.ts';
+import { frontendDocument, frontendEscapeProblems, frontendFenceProblem, frontendQuality } from '../../shared/card-studio/frontend.ts';
 import type { CompileIssue, FrontendResources } from '../../shared/card-studio/frontend-compile.ts';
 import { findSource, regexFromString, type PreviewRegex } from '../../shared/card-studio/preview.ts';
 import { UNCLASSIFIED_SECTION } from '../../shared/card-studio/boards.ts';
@@ -312,6 +312,7 @@ async function checkRegexComponents(project: ProjectComponents, sample: string |
     if (item.params.promptOnly !== true && entry.replacement) {
       const fence = frontendFenceProblem(entry.replacement);
       if (fence) findings.push({ level: 'error', code: 'frontend-fence', path: item.bodyPath, message: `「${label}」${fence}` });
+      for (const problem of frontendEscapeProblems(entry.replacement)) findings.push({ ...problem, path: item.bodyPath, message: `「${label}」${problem.message}` });
       const document = frontendDocument(entry.replacement);
       if (document) for (const finding of frontendQuality(document)) findings.push({ ...finding, path: item.bodyPath, message: `「${label}」${finding.message}` });
     }
