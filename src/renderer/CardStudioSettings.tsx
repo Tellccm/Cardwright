@@ -54,7 +54,7 @@ export function CardStudioSettings() {
 
     <h3 className="settings-section-title">{t('Squads', '小队')}</h3>
     <p className="settings-intro">{t('Planning and section AIs can send squad members to work in parallel: 查资料 only reads and reports back, 写组件 writes only the components it is given.', '规划 AI 和分区 AI 可以派小队成员分头做：「查资料」只读，交回要点；「写组件」只写分给它的组件。')}</p>
-    <Row title={t('Sub-agents', '子代理')} description={t('The most a conversation may send. Off: none (an Ultra planning conversation can still send 查资料). Read only: 查资料. Can write: both.', '最多能派哪种成员。关：不派（Ultra 档的规划仍能派「查资料」）；只读：只派「查资料」；可写：两种都能派。')}>
+    <Row title={t('Sub-agents', '子代理')} description={t('The most a conversation may send below Ultra. Off: none. Read only: 查资料. Can write: both. Ultra sends a squad anyway: planning 查资料, other sections both.', '不选 Ultra 时最多能派哪种成员：关不派，只读只派「查资料」，可写两种都能派。选 Ultra 时照样派：规划派「查资料」，其他分区两种都能派。')}>
       <div className="segmented" role="group" aria-label={t('Sub-agents', '子代理')}>{SQUAD_MODES.map(mode => <button key={mode.id} type="button" className={squad.mode === mode.id ? 'active' : ''} aria-pressed={squad.mode === mode.id} onClick={() => { if (squad.mode !== mode.id) saveSquad({ mode: mode.id }); }}>{t(mode.en, mode.zh)}</button>)}</div>
     </Row>
     <Row title={t('Self-organised squads', '自行组队')} description={squad.mode === 'off' ? t('Turn the sub-agents on first.', '先打开子代理。') : t('On: the AI decides when to send members, by the built-in rules. Off: only when you ask for it in your message.', '开：AI 按内置标准自己决定什么时候派；关：只在你的消息里明确要求时才派。')}>

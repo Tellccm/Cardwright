@@ -462,7 +462,7 @@ test('each card remembers its permission mode and its kickoff effort and model',
   assert.deepEqual(harness.snapshot().projects.find(project => project.id === projectId)?.cardSettings?.kickoff, { thinking: 'ultra', gatewayId: 'thinker', modelId: 'quick' });
 });
 
-test('only an Ultra planning conversation gets a squad, and its members only read', async t => {
+test('with 子代理 off only an Ultra conversation gets a squad — planning’s members only read, and a section may send writers too', async t => {
   const { root, harness, studio } = await setup(t);
   harness.saveGateway({ id: 'thinker', name: 'Thinker', baseUrl: 'https://example.invalid/v1', modelId: 'deep', protocol: 'openai-completions', reasoning: true, contextWindow: 200000, maxTokens: 8192 }, 'fixture-key-never-a-real-credential');
   harness.savePreferences({ maxConcurrent: 4 });
@@ -476,7 +476,9 @@ test('only an Ultra planning conversation gets a squad, and its members only rea
   };
   assert.equal((await report({ projectId, sectionId: 'plan', thinking: 'ultra', gatewayId: 'thinker' })).canDelegate, true);
   assert.equal((await report({ projectId, sectionId: 'plan', thinking: 'high', gatewayId: 'thinker' })).canDelegate, false);
-  assert.equal((await report({ projectId, sectionId: 'lore-rules', thinking: 'ultra', gatewayId: 'thinker' })).canDelegate, false);
+  const ultraSection = await report({ projectId, sectionId: 'lore-rules', thinking: 'ultra', gatewayId: 'thinker' });
+  assert.equal(ultraSection.canDelegate, true, 'Ultra works in every section (1.3.2)');
+  assert.equal((await report({ projectId, sectionId: 'lore-rules', thinking: 'high', gatewayId: 'thinker' })).canDelegate, false);
 
   const lead = await studio.startConversation({ projectId, sectionId: 'plan', thinking: 'ultra', gatewayId: 'thinker', prompt: 'team:inspect-init' });
   await until(() => settled(harness, lead.id), 'the planning lead collects its squad');

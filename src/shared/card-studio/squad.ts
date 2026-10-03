@@ -44,9 +44,13 @@ export function cardRoleId(value: string): CardMemberRole | null {
   return null;
 }
 
-/** The members one card conversation may start (spec §6.1): a member none; the rest by the switch, and an Ultra planning conversation 查资料 even when it is off. */
+/**
+ * The members one card conversation may start (spec §6.1): a member none; the rest by the switch. Choosing Ultra is choosing
+ * a squad whatever the switch (1.3.2): planning sends 查资料, any other section both kinds, since its work is writing.
+ */
 export function cardDispatchRoles(input: { settings: CardSquadSettings; sectionId: string; thinking: string; member: boolean }): CardMemberRole[] {
   if (input.member) return [];
+  if (input.thinking === 'ultra' && input.sectionId !== 'plan') return ['researcher', 'writer'];
   if (input.settings.mode === 'write') return ['researcher', 'writer'];
   if (input.settings.mode === 'read' || (input.sectionId === 'plan' && input.thinking === 'ultra')) return ['researcher'];
   return [];

@@ -30,7 +30,8 @@ test('the composer’s squad chip says what this conversation may send now, with
   const composer = read('card-studio/StudioComposer.tsx');
   assert.ok(composer.includes('cardDispatchRoles({ settings: squad, sectionId, thinking: currentThinking, member: false })'));
   assert.ok(composer.includes('const squad = cardSquadSettings(data.preferences);'));
-  for (const text of ["'小队 · 关'", "'小队 · 只读'", "'小队 · 可写'", '自行组队：开', '自行组队：关', '规划选 Ultra 时照旧可派「查资料」']) assert.ok(composer.includes(text), text);
+  for (const text of ["'小队 · 关'", "'小队 · 只读'", "'小队 · 可写'", '自行组队：开', '自行组队：关', '选了 Ultra：活能拆开时派小队', '选 Ultra 时照样派']) assert.ok(composer.includes(text), text);
+  assert.doesNotMatch(composer, /level !== 'ultra' \|\| sectionId === 'plan'/, 'Ultra is offered in every section (1.3.2)');
   assert.match(composer, /title=\{squadTip\}/);
   assert.doesNotMatch(composer, /只有规划选 Ultra 时才派只读小队|只读读资料/, 'the 1.2 rule is gone');
 });

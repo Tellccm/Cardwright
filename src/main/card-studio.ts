@@ -146,8 +146,8 @@ export class CardStudioService {
     if (dispatch && dispatch.sectionId !== input.sectionId) throw new Error('这条派单不属于这个分区。');
     const mode = input.sectionId === 'plan' ? input.mode ?? (view.origin === 'import' ? 'refine' : 'scratch') : undefined;
     const title = (input.title?.trim() || (input.kickoff ? mode === 'refine' ? '完善优化卡' : '从零开始制卡' : dispatch?.title) || '新对话').slice(0, 160);
-    // Ultra belongs to planning, which may then send 查资料 even with the 子代理 switch off (spec §6.1); elsewhere it means the highest effort.
-    const thinking = input.thinking === 'ultra' && input.sectionId !== 'plan' ? 'max' : input.thinking;
+    // Ultra works in every section (1.3.2): the highest effort, and a squad whatever the 子代理 switch (cardDispatchRoles).
+    const thinking = input.thinking;
     const task = await this.harness.createTask({
       projectId: project.id, title, prompt: input.kickoff ? await this.prompts.effective(`kickoff/${mode ?? 'scratch'}`) : input.prompt, permission: input.permission ?? project.cardSettings?.permission ?? 'edit', isolated: false,
       ...(thinking ? { thinking } : {}), ...(input.gatewayId ? { gatewayId: input.gatewayId } : {}), ...(input.modelId ? { modelId: input.modelId } : {}),
@@ -517,8 +517,11 @@ export class CardStudioService {
     const settings = cardSquadSettings(this.harness.store.state.preferences);
     const roles = cardDispatchRoles({ settings, sectionId: card.sectionId, thinking: task.thinking, member: false });
     if (!roles.length) return { prompt, readRoots: [this.resourceRoot], ...registers };
-    const rules = squadDispatchPrompt(await read(`prompts/${SQUAD_PROMPT_FILES.dispatch}`), { selfDispatch: effectiveSelfDispatch(settings) });
-    return { prompt: `${prompt}\n\n${rules}`, readRoots: [this.resourceRoot], dispatchRoles: roles.map(role => CARD_ROLES[role]), ...registers };
+    // Choosing Ultra is asking for a squad (1.3.2): the AI decides when, whatever 自行组队 says, and a section lead is told to split its work.
+    const ultra = task.thinking === 'ultra';
+    const rules = squadDispatchPrompt(await read(`prompts/${SQUAD_PROMPT_FILES.dispatch}`), { selfDispatch: ultra || effectiveSelfDispatch(settings) });
+    const push = ultra && card.sectionId !== 'plan' ? '\n\n这一轮选了 Ultra：能拆开的活优先派小队并行做。要写的组件分给「写组件」成员，每人只拿自己那几个；要查的资料交给「查资料」。共享文件留给你自己最后统一改。活很小或前后紧密依赖时，自己做。' : '';
+    return { prompt: `${prompt}\n\n${rules}${push}`, readRoots: [this.resourceRoot], dispatchRoles: roles.map(role => CARD_ROLES[role]), ...registers };
   }
 
   async readPrompt(projectId: string, sectionId: string, mode?: PlanMode): Promise<string> {

@@ -18,7 +18,7 @@ Cardwright 是面向 Windows 本地项目的 Agent 工作台：连接你自己�
 
 ### 安装
 
-从 [Releases](../../releases) 下载 `Cardwright-Setup-1.3.1.exe` 并安装。安装包没有代码签名，Windows 首次运行会提示「未知发布者」，可以选择「更多信息 → 仍要运行」。卸载时保留你的资料目录。
+从 [Releases](../../releases) 下载 `Cardwright-Setup-1.3.2.exe` 并安装。安装包没有代码签名，Windows 首次运行会提示「未知发布者」，可以选择「更多信息 → 仍要运行」。卸载时保留你的资料目录。
 
 也可以自己构建：
 
@@ -85,7 +85,7 @@ node scripts/package.mjs      # 便携版输出到 release/<版本>/Cardwright-w
 - **质量检查**：手机宽度下横向滚动、没有任何交互反馈、正文对比度不足、直接引用 Google 字体、塞了大图 base64、会卡死的正则会禁止导出；设计令牌太少、没有 `@media`、循环动画不照顾「减少动画」、强调色用得太多、字体镜像与外链素材、在安卓上表现不同的正则写法会提醒。
 - **一处提改动**：点卡项目主页的「提改动」，或在任意分区输入 `/改动`：一句话说要改什么，或者贴一段酒馆里的报错，AI 读整张卡列出影响清单；删掉不要的条目，点「照单开做」，应用按分区的先后顺序一口气改完，再跑拼装检查。只动一个文件时直接改好，可以撤销。没有设计书的卡也能用。
 - **导入更顺**：导入时先看条目名里的标记（`[initvar]`、人物总览、地点总览等）再看编号来分区；未分类的条目可以多选后一起移到分区，也可以点「AI 归类建议」，确认之后才搬。
-- **小队**：「工作室设置 → 制卡」里的「子代理」可以设成关、只读或可写（默认关）。打开后规划和分区可以派成员分头做：只读时派「查资料」，可写时再加「写组件」。写组件只能改分给它的组件，人物总览、出处索引、设计书、变量表只由主 AI 改；成员写的文件算进本轮写入，可以一起撤销。「自行组队」决定由 AI 自己判断什么时候派，还是只在你要求时派。
+- **小队**：「工作室设置 → 制卡」里的「子代理」可以设成关、只读或可写（默认关）。打开后规划和分区可以派成员分头做：只读时派「查资料」，可写时再加「写组件」。写组件只能改分给它的组件，人物总览、出处索引、设计书、变量表只由主 AI 改；成员写的文件算进本轮写入，可以一起撤销。「自行组队」决定由 AI 自己判断什么时候派，还是只在你要求时派。任何分区都能选 Ultra：选了就照样派小队，规划派「查资料」，其他分区两种都派，不受这个开关限制。
 - **分批写**：分区 AI 一次只写一个组件文件，规划分批登记派单；一键制作遇到还没写完的派单会接着做完（一条派单最多自动接 20 轮，之后停下来等你点【继续】）。
 - 说错了话可以撤回：AI 还在写时，撤回会停下这一轮、把这条消息收回，文字放回输入框，它发出的派单回到「未派」；已经写完的消息可以编辑后重新生成，产生新的对话版本。写进卡项目的文件不跟着回滚，要退文件用「本轮写入」里的【撤销本轮】。
 - 工坊的标题和正文用内置的开源宋体（Noto Serif SC 的子集），每台电脑上看起来都一样。
@@ -137,7 +137,7 @@ The interface stays quiet, deterministic rules are executed by the program, and 
 
 ### Install
 
-Download `Cardwright-Setup-1.3.1.exe` from [Releases](../../releases). The installer is not code-signed, so Windows shows an "unknown publisher" warning the first time; choose "More info → Run anyway". Uninstalling keeps your data directory.
+Download `Cardwright-Setup-1.3.2.exe` from [Releases](../../releases). The installer is not code-signed, so Windows shows an "unknown publisher" warning the first time; choose "More info → Run anyway". Uninstalling keeps your data directory.
 
 Or build it yourself:
 
@@ -204,7 +204,7 @@ Enter from the bottom of the sidebar. A card project is a local folder and appea
 - **Quality checks**: horizontal scrolling at phone width, no interaction feedback at all, body text below 4.5:1, Google's own font links, big base64 images and regexes that can hang block the export; too few design tokens, no `@media`, looping motion that ignores reduced motion, an overused accent, font mirrors and external media, and regex writings that behave differently on Android are warnings.
 - **Change it in one place**: Ask for a change on the card project home, or type `/改动` in any section: say in a sentence what to change, or paste an error from SillyTavern, and the AI reads the whole card and lists what the change affects. Take out what you do not want, press Go ahead, and the application works through the sections in dependency order and runs the assembly checks. A change to a single file is made directly and can be undone. Cards without a design document work too.
 - **Smoother imports**: entries are sorted by the markers in their names first (`[initvar]`, character and place overviews and the like) and by their order number second; unclassified entries can be moved to a section several at a time, or you can ask for AI suggestions and confirm them before anything moves.
-- **Squads**: the "Sub-agents" setting under Studio settings → Card studio can be Off, Read only or Can write (off by default). When it is on, planning and the section AIs can send members to work in parallel: 查资料 (research) when it is Read only, 写组件 (write a component) as well when it can write. A 写组件 member can change only the components it was given; the character overview, the source index, the design document and the variable table stay with the main AI. What the members write counts in the turn's writes and is undone together with them. "Self-organised squads" decides whether the AI judges when to send members, or sends them only when you ask.
+- **Squads**: the "Sub-agents" setting under Studio settings → Card studio can be Off, Read only or Can write (off by default). When it is on, planning and the section AIs can send members to work in parallel: 查资料 (research) when it is Read only, 写组件 (write a component) as well when it can write. A 写组件 member can change only the components it was given; the character overview, the source index, the design document and the variable table stay with the main AI. What the members write counts in the turn's writes and is undone together with them. "Self-organised squads" decides whether the AI judges when to send members, or sends them only when you ask. Ultra is offered in every section and sends a squad whatever the setting: planning sends 查资料, the other sections both kinds.
 - **Batched writing**: a section AI writes one component file per request, and planning registers its dispatches a board at a time. One-click making carries on with a dispatch that is not finished yet (at most 20 rounds for one dispatch, then it stops and waits for you to press Continue).
 - A message can be withdrawn: while the AI is still writing, withdrawing stops the turn, takes the message back, returns its text to the composer and puts a dispatch it sent back to not sent. A finished message can be edited and regenerated into a new conversation version. Files already written stay as they are; use Undo this turn in the turn's writes to take them back.
 - The studio's headings and text use a bundled open-source serif (a subset of Noto Serif SC), so it looks the same on every computer.

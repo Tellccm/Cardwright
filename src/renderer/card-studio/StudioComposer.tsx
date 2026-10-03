@@ -55,8 +55,8 @@ export function StudioComposer({ card, sectionId, task }: { card: CardProjectVie
   const draftGatewayId = draftModel?.gatewayId ?? (data.gateways.find(item => item.id === data.preferences.defaultGatewayId) ?? data.gateways[0])?.id ?? '';
   const gateway = task ? selectedModel(data.gateways.find(item => item.id === task.gatewayId), task.modelId, task.contextWindow)
     : selectedModel(data.gateways.find(item => item.id === draftGatewayId), draftModel?.modelId ?? (draftGatewayId === data.preferences.defaultGatewayId ? data.preferences.defaultModelId : undefined));
-  // Ultra belongs to planning, which may then send 查资料 even with the 子代理 switch off (spec §6.1).
-  const efforts = gateway ? availableEfforts(gateway).filter(level => level !== 'ultra' || sectionId === 'plan') : ['off' as ThinkingLevel];
+  // Ultra works in every section (1.3.2) and sends a squad whatever the 子代理 switch (cardDispatchRoles).
+  const efforts = gateway ? availableEfforts(gateway) : ['off' as ThinkingLevel];
   const permission: PermissionMode = task ? task.permission : settings?.permission ?? 'edit';
   const labels = cardPermissionLabels(t);
   const currentThinking = task ? task.thinking : efforts.includes(thinking) ? thinking : efforts.includes('medium') ? 'medium' : efforts[0];
@@ -66,10 +66,11 @@ export function StudioComposer({ card, sectionId, task }: { card: CardProjectVie
   const squad = cardSquadSettings(data.preferences);
   const squadRoles = cardDispatchRoles({ settings: squad, sectionId, thinking: currentThinking, member: false });
   const squadLabel = squadRoles.includes('writer') ? t('Squad · can write', '小队 · 可写') : squadRoles.length ? t('Squad · read only', '小队 · 只读') : t('Squad · off', '小队 · 关');
-  const squadTip = squad.mode !== 'off'
-    ? squad.selfDispatch ? t('Self-organised squads on: the AI decides when to send members.', '自行组队：开，由 AI 自己判断什么时候派。') : t('Self-organised squads off: members go out only when you ask for them in your message.', '自行组队：关，只在你的消息里明确要求时才派。')
-    : squadRoles.length ? t('Sub-agents are off in Studio settings, but Ultra planning still sends 查资料; the AI decides when.', '工作室设置里的「子代理」是关，但规划选 Ultra 时照旧可派「查资料」，由 AI 自己判断什么时候派。')
-      : t('Sub-agents are off in Studio settings, so this conversation sends no squad. Ultra planning still sends 查资料.', '工作室设置里的「子代理」是关，这个对话不派小队；规划选 Ultra 时照旧可派「查资料」。');
+  const squadTip = currentThinking === 'ultra' && squadRoles.length
+    ? t('Ultra: a squad goes out when the work splits; the AI decides when.', '选了 Ultra：活能拆开时派小队，由 AI 自己判断什么时候派。')
+    : squad.mode !== 'off'
+      ? squad.selfDispatch ? t('Self-organised squads on: the AI decides when to send members.', '自行组队：开，由 AI 自己判断什么时候派。') : t('Self-organised squads off: members go out only when you ask for them in your message.', '自行组队：关，只在你的消息里明确要求时才派。')
+      : t('Sub-agents are off in Studio settings, so this conversation sends no squad. Choose Ultra to send one anyway.', '工作室设置里的「子代理」是关，这个对话不派小队；选 Ultra 时照样派。');
 
   useEffect(() => { const element = textarea.current; if (element) { element.style.height = 'auto'; element.style.height = `${Math.min(element.scrollHeight, 260)}px`; } }, [text]);
   useEffect(() => { if (draft) textarea.current?.focus(); }, [draft?.title, draft?.dispatchId]);

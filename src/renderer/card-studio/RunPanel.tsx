@@ -49,8 +49,8 @@ export function RunDialog({ card, scope, change, onClose }: { card: CardProjectV
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState('');
   const gateway = selectedModel(data.gateways.find(item => item.id === choice.gatewayId), choice.modelId);
-  // Ultra belongs to planning (spec §6.1); a run never plans.
-  const efforts: ThinkingLevel[] = (gateway ? availableEfforts(gateway) : ['off' as ThinkingLevel]).filter(level => level !== 'ultra');
+  // Ultra works in every section (1.3.2): each section the run reaches may send a squad.
+  const efforts: ThinkingLevel[] = gateway ? availableEfforts(gateway) : ['off' as ThinkingLevel];
   const thinking = efforts.includes(choice.thinking) ? choice.thinking : efforts.includes('high') ? 'high' : efforts[efforts.length - 1] ?? 'off';
   const labels = cardPermissionLabels(t);
   const confirming = scope === 'change' && change?.status === 'draft';
@@ -91,6 +91,7 @@ export function RunDialog({ card, scope, change, onClose }: { card: CardProjectV
     <div className="cs-run-fields">
       <div className="cs-field is-slider"><span>{t('Effort', '思考强度')} · {thinkingLabel(thinking, t)}</span>
         <EffortSlider levels={efforts} value={thinking} disabled={!gateway} onChange={level => setChoice(current => ({ ...current, thinking: level }))} />
+        {thinking === 'ultra' && <p className="cs-kickoff-note">{t('Ultra lets each section send a squad to split the work; it costs noticeably more.', 'Ultra 会让各分区派小队分头做，花费明显更高。')}</p>}
       </div>
       <div className="cs-field"><span>{t('Model', '模型')}</span>
         <ModelPicker gatewayId={choice.gatewayId} modelId={gateway?.modelId} onChange={(gatewayId, modelId) => setChoice(current => ({ ...current, gatewayId, modelId }))} />

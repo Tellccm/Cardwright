@@ -26,7 +26,9 @@ test('who may send whom (spec §6.1)', () => {
   const write = { mode: 'write', selfDispatch: false } as const;
   assert.deepEqual(cardDispatchRoles({ settings: off, sectionId: 'lore-people', thinking: 'high', member: false }), []);
   assert.deepEqual(cardDispatchRoles({ settings: off, sectionId: 'plan', thinking: 'ultra', member: false }), ['researcher'], 'Ultra planning still reads');
-  assert.deepEqual(cardDispatchRoles({ settings: off, sectionId: 'lore-people', thinking: 'ultra', member: false }), []);
+  assert.deepEqual(cardDispatchRoles({ settings: off, sectionId: 'lore-people', thinking: 'ultra', member: false }), ['researcher', 'writer'], 'Ultra in a section sends both, whatever the switch (1.3.2)');
+  assert.deepEqual(cardDispatchRoles({ settings: read, sectionId: 'lore-people', thinking: 'ultra', member: false }), ['researcher', 'writer']);
+  assert.deepEqual(cardDispatchRoles({ settings: off, sectionId: 'lore-people', thinking: 'ultra', member: true }), [], 'a member never sends anyone, even under Ultra');
   assert.deepEqual(cardDispatchRoles({ settings: read, sectionId: 'lore-people', thinking: 'medium', member: false }), ['researcher']);
   assert.deepEqual(cardDispatchRoles({ settings: write, sectionId: 'plan', thinking: 'medium', member: false }), ['researcher', 'writer']);
   assert.deepEqual(cardDispatchRoles({ settings: write, sectionId: 'lore-people', thinking: 'medium', member: true }), [], 'a member never sends anyone');
