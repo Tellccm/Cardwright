@@ -97,3 +97,85 @@ test('integration requires the configured checks for the exact reviewed file ver
   f.studio.saveChecks(f.projectInfo.id, []); const missing = await f.studio.integrateSquad(f.task.id); f.studio.saveChecks(f.projectInfo.id, [{ id: 'new-check', name: 'Added after review', command: 'Write-Output ok', enabled: true }]); await assert.rejects(f.studio.applyIntegration(f.task.id, missing.integration.id), /missing/);
   const valid = await f.studio.integrateSquad(f.task.id); f.studio.saveChecks(f.projectInfo.id, [{ id: 'new-check', name: 'Added after review', command: "Write-Output 'RUNNING'; Start-Sleep -Milliseconds 600", enabled: true }]); const running = f.studio.runTaskChecks(f.task.id); await assert.rejects(f.studio.applyIntegration(f.task.id, valid.integration.id), /checks|file operation/); await running;
 });
+
+test('role model choices saved under the 1.2 built-in ids follow the new ids', async t => {
+  let harness: Harness | undefined;
+  const f = await folder(t, async () => { await harness?.close(); });
+  const choice = (thinking: string) => ({ gatewayId: 'fixture', modelId: 'fixture', thinking });
+  await writeFile(join(f.data, 'studio.json'), JSON.stringify({ preferences: { roleModels: { Explore: choice('low'), explorer: choice('high'), 'general-purpose': choice('medium') } } }));
+  harness = new Harness(f.data, resolve('test/fixtures/fake-worker.mjs'), new Vault(f.data, codec), { paused: true });
+  const studio = new StudioServices(f.data, harness, resolve('dist/Cardwright.CommandHost.exe'), buffer => buffer);
+  harness.attachStudio(studio);
+  assert.deepEqual(Object.keys(studio.state.preferences.roleModels).sort(), ['executor', 'explorer']);
+  assert.equal(studio.state.preferences.roleModels.explorer.thinking, 'high', 'an entry already under the new id wins');
+  harness.saveGateway({ id: 'fixture', name: 'Fixture', baseUrl: 'https://example.invalid/v1', modelId: 'fixture', protocol: 'openai-completions', reasoning: false, contextWindow: 300000, maxTokens: 1000 }, 'never-a-real-key');
+  studio.settings({ roleModels: { Plan: choice('max') } });
+  assert.deepEqual(Object.keys(studio.state.preferences.roleModels), ['planner']);
+});
+
+test('a 1.2 profile starts tasks: a new one, and one saved under an old role id, which runs as its new role with the old switch and model choice', async t => {
+  let harness: Harness | undefined;
+  const f = await folder(t, async () => { await harness?.close(); });
+  // Discovery reads ~/.claude/agents; an empty home keeps a developer's own subagents out of this test.
+  const home = join(f.root, 'home'); await mkdir(home);
+  const previousHome = process.env.CARDWRIGHT_SKILL_HOME; process.env.CARDWRIGHT_SKILL_HOME = home;
+  t.after(() => { if (previousHome === undefined) delete process.env.CARDWRIGHT_SKILL_HOME; else process.env.CARDWRIGHT_SKILL_HOME = previousHome; });
+  const at = '2026-09-30T00:00:00.000Z';
+  await writeFile(join(f.data, 'state.json'), JSON.stringify({
+    schemaVersion: 8,
+    preferences: { disabledAgentIds: ['Plan'] },
+    projects: [{ id: 'p', name: 'project', path: f.project, isGit: false, createdAt: at }],
+    ecosystem: { roles: [
+      { id: 'general-purpose', name: 'General purpose', prompt: 'old', readOnly: false, builtIn: true },
+      { id: 'Explore', name: 'Explore', prompt: 'old', readOnly: true, builtIn: true },
+      { id: 'Plan', name: 'Plan', prompt: 'old', readOnly: true, builtIn: true },
+    ] },
+    tasks: [{ id: 'old', projectId: 'p', title: 'Saved by 1.2', cwd: f.project, status: 'completed', permission: 'ask', gatewayId: 'fixture', thinking: 'medium', createdAt: at, updatedAt: at, messages: [], tools: [], role: 'Explore' }],
+  }));
+  await writeFile(join(f.data, 'studio.json'), JSON.stringify({ preferences: { roleModels: { Explore: { gatewayId: 'fixture', modelId: 'fixture', thinking: 'low' } } } }));
+  harness = new Harness(f.data, resolve('test/fixtures/fake-worker.mjs'), new Vault(f.data, codec), { paused: true });
+  const studio = new StudioServices(f.data, harness, resolve('dist/Cardwright.CommandHost.exe'), buffer => buffer);
+  harness.attachStudio(studio);
+  harness.saveGateway({ id: 'fixture', name: 'Fixture', baseUrl: 'https://example.invalid/v1', modelId: 'fixture', protocol: 'openai-completions', reasoning: true, contextWindow: 300000, maxTokens: 1000 }, 'never-a-real-key');
+  harness.resumeStartup();
+  const task = (id: string) => harness!.snapshot().tasks.find(item => item.id === id)!;
+  assert.deepEqual(harness.snapshot().ecosystem.roles.map(role => [role.id, role.enabled]), [['executor', true], ['explorer', true], ['planner', false]], 'the switch saved under Plan keeps 规划师 off');
+  assert.deepEqual(Object.keys(studio.state.preferences.roleModels), ['explorer']);
+  await harness.prompt('old', 'inspect-init');
+  // A finished task holds its folder until its worker is retired, after the checkpoint is sealed.
+  await until(() => task('old').status === 'completed' && !task('old').workerActive);
+  const seen = JSON.parse(task('old').messages.findLast(message => message.role === 'assistant')!.text) as { role: string; readOnly: boolean };
+  assert.deepEqual([task('old').role, seen.role, seen.readOnly], ['explorer', 'explorer', true], 'the task saved as Explore runs as the read-only 探索员');
+  // Before this change a 1.2 profile refused every new task with "Select an available agent role.".
+  const lead = await harness.createTask({ projectId: 'p', isolated: false, prompt: 'delegate-role:Explore' });
+  assert.equal(lead.role, 'executor');
+  await until(() => task(lead.id).status === 'completed');
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  assert.deepEqual([member.role, member.thinking], ['explorer', 'low'], 'the model choice saved under Explore reaches the 探索员 member');
+});
+
+test('a 1.2 custom role moved off a reserved id takes its role model choice along, and nothing moves twice', async t => {
+  let harness: Harness | undefined;
+  const f = await folder(t, async () => { await harness?.close(); });
+  const choice = (thinking: string) => ({ gatewayId: 'fixture', modelId: 'fixture', thinking });
+  const saved12 = JSON.stringify({ schemaVersion: 8, ecosystem: { roles: [
+    { id: 'Plan', name: 'Plan', prompt: 'old', readOnly: true, builtIn: true },
+    { id: 'planner', name: '我的规划', prompt: '按我的格式写计划。', readOnly: false, builtIn: false },
+  ] } });
+  await writeFile(join(f.data, 'state.json'), saved12);
+  await writeFile(join(f.data, 'studio.json'), JSON.stringify({ preferences: { roleModels: { planner: choice('low'), Plan: choice('high') } } }));
+  const open = () => {
+    harness = new Harness(f.data, resolve('test/fixtures/fake-worker.mjs'), new Vault(f.data, codec), { paused: true });
+    const studio = new StudioServices(f.data, harness, resolve('dist/Cardwright.CommandHost.exe'), buffer => buffer);
+    harness.attachStudio(studio);
+    return studio.state.preferences.roleModels;
+  };
+  const moved = { 'planner-custom': choice('low'), planner: choice('high') };
+  assert.deepEqual(open(), moved, 'the custom 我的规划 keeps its choice and 规划师 gets the one saved under Plan');
+  assert.deepEqual(JSON.parse(await readFile(join(f.data, 'studio.json'), 'utf8')).preferences.roleModels, moved, 'written at once: the next load no longer sees the rename');
+  await harness!.close();
+  assert.deepEqual(open(), moved, 'after a restart');
+  await harness!.close();
+  await writeFile(join(f.data, 'state.json'), saved12);
+  assert.deepEqual(open(), moved, 'a state file still from 1.2 (closed before it was saved) moves the role again, but not its choice');
+});

@@ -127,17 +127,18 @@ export function VariableTableEditor({ projectId, onClose }: { projectId: string;
     {rows === null ? <p className="muted"><LoaderCircle size={14} className="spinning" /> {t('Reading…', '读取中…')}</p> : <>
       <div className="variable-table-scroll">
         <table className="variable-table-grid">
+          <colgroup><col className="is-path" /><col className="is-type" /><col className="is-default" /><col className="is-owner" /><col className="is-when" /><col /><col className="is-remove" /></colgroup>
           <thead><tr>
             <th>{t('Path', '路径')}</th><th>{t('Type', '类型')}</th><th>{t('Default / values', '默认 / 取值')}</th>
             <th>{t('Owner', '维护者')}</th><th>{t('When', '更新时机')}</th><th>{t('Note', '说明')}</th><th />
           </tr></thead>
           <tbody>
             {rows.map((row, index) => <tr key={index}>
-              <td><input value={row.path} spellCheck={false} aria-label={`${t('Path', '路径')} ${index + 1}`} onChange={event => update(index, { path: event.target.value })} placeholder="/主角/生命" /></td>
+              <td><input value={row.path} title={row.path} spellCheck={false} aria-label={`${t('Path', '路径')} ${index + 1}`} onChange={event => update(index, { path: event.target.value })} placeholder="/主角/生命" /></td>
               <td><select value={row.type} aria-label={`${t('Type', '类型')} ${index + 1}`} onChange={event => update(index, { type: event.target.value })}>{VARIABLE_TYPES.map(type => <option key={type} value={type}>{type}</option>)}</select></td>
               <td>
                 {row.type === '布尔' ? <select value={row.value} aria-label={`${t('Default', '默认')} ${index + 1}`} onChange={event => update(index, { value: event.target.value })}><option value="false">false</option><option value="true">true</option></select>
-                  : row.type === '枚举' ? <input value={row.values} aria-label={`${t('Values', '取值')} ${index + 1}`} onChange={event => update(index, { values: event.target.value })} placeholder={t('one, two, three', '选项一, 选项二')} />
+                  : row.type === '枚举' ? <input value={row.values} title={row.values} aria-label={`${t('Values', '取值')} ${index + 1}`} onChange={event => update(index, { values: event.target.value })} placeholder={t('one, two, three', '选项一, 选项二')} />
                   : row.type === '数值' ? <span className="variable-table-number">
                       <input value={row.value} aria-label={`${t('Default', '默认')} ${index + 1}`} onChange={event => update(index, { value: event.target.value })} placeholder="0" />
                       <input value={row.min} aria-label={`${t('Minimum', '最小值')} ${index + 1}`} onChange={event => update(index, { min: event.target.value })} placeholder={t('min', '最小')} />
@@ -148,11 +149,11 @@ export function VariableTableEditor({ projectId, onClose }: { projectId: string;
                       <input value={row.limit} aria-label={`${t('Limit', '上限')} ${index + 1}`} onChange={event => update(index, { limit: event.target.value })} placeholder={t('limit', '上限')} />
                     </span>
                   : row.type === '记录' ? <input value={row.limit} aria-label={`${t('Limit', '上限')} ${index + 1}`} onChange={event => update(index, { limit: event.target.value })} placeholder={t('limit', '上限')} />
-                  : <input value={row.value} aria-label={`${t('Default', '默认')} ${index + 1}`} onChange={event => update(index, { value: event.target.value })} />}
+                  : <input value={row.value} title={row.value} aria-label={`${t('Default', '默认')} ${index + 1}`} onChange={event => update(index, { value: event.target.value })} />}
               </td>
               <td><select value={row.owner} aria-label={`${t('Owner', '维护者')} ${index + 1}`} onChange={event => update(index, { owner: event.target.value })}>{VARIABLE_OWNERS.map(owner => <option key={owner} value={owner}>{owner}</option>)}</select></td>
-              <td><input value={row.when} aria-label={`${t('When', '更新时机')} ${index + 1}`} onChange={event => update(index, { when: event.target.value })} /></td>
-              <td><input value={row.note} aria-label={`${t('Note', '说明')} ${index + 1}`} onChange={event => update(index, { note: event.target.value })} /></td>
+              <td><input value={row.when} title={row.when} aria-label={`${t('When', '更新时机')} ${index + 1}`} onChange={event => update(index, { when: event.target.value })} /></td>
+              <td><input value={row.note} title={row.note} aria-label={`${t('Note', '说明')} ${index + 1}`} onChange={event => update(index, { note: event.target.value })} /></td>
               <td><button type="button" className="cs-icon-button" aria-label={`${t('Remove row', '删除这一行')} ${index + 1}`} disabled={rows.length < 2} onClick={() => { setRows(current => current!.filter((_, position) => position !== index)); setError(''); }}><Trash2 size={13} /></button></td>
             </tr>)}
           </tbody>

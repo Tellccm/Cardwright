@@ -1,3 +1,5 @@
+import { boundedCooldown } from '../shared/gateway-traffic.ts';
+
 /**
  * 每分钟请求上限 and 网关冷却.
  *
@@ -20,6 +22,9 @@ export interface RateLimitState {
   /** Requests waiting for a slot. */
   waiting: number;
 }
+
+/** Why a request waits for its slot, and until when, in the limiter's clock (1.3.0 §5.5 网络状态). */
+export interface SlotWait { reason: 'limit' | 'cooldown'; until: number }
 
 const WINDOW = 60_000;
 
@@ -48,28 +53,29 @@ export class RateLimiter {
   }
 
   /** Milliseconds until the next request may go out, or 0 when one may go now. */
-  delayFor(gatewayId: string, limit: number): number { return this.wait(this.gate(gatewayId), limit); }
-  private wait(gate: Gate, limit: number): number {
+  delayFor(gatewayId: string, limit: number): number { return this.wait(this.gate(gatewayId), limit).ms; }
+  private wait(gate: Gate, limit: number): { ms: number; reason: SlotWait['reason'] } {
     const now = this.now();
     const cooling = Math.max(0, gate.cooldownUntil - now);
-    if (cooling > 0) return cooling;
-    if (limit <= 0 || gate.sent.length < limit) return 0;
-    return Math.max(1, gate.sent[gate.sent.length - limit] + WINDOW - now);
+    if (cooling > 0) return { ms: cooling, reason: 'cooldown' };
+    if (limit <= 0 || gate.sent.length < limit) return { ms: 0, reason: 'limit' };
+    return { ms: Math.max(1, gate.sent[gate.sent.length - limit] + WINDOW - now), reason: 'limit' };
   }
 
   /**
-   * Takes a slot, waiting if the gateway is at its limit or cooling down.
+   * Takes a slot, waiting if the gateway is at its limit or cooling down; `onWait` hears each wait before it begins.
    * Resolves once the request may be sent; rejects if the caller gives up.
    */
-  async acquire(gatewayId: string, limit: number, signal?: AbortSignal): Promise<void> {
+  async acquire(gatewayId: string, limit: number, signal?: AbortSignal, onWait?: (wait: SlotWait) => void): Promise<void> {
     if (limit <= 0 && !this.gates.get(gatewayId)?.cooldownUntil) { this.gate(gatewayId).sent.push(this.now()); return; }
     const gate = this.gate(gatewayId);
     for (;;) {
       if (signal?.aborted) throw new Error('This request was cancelled while it waited for a rate-limit slot.');
-      const delay = this.wait(gate, limit);
-      if (delay <= 0) { gate.sent.push(this.now()); return; }
+      const { ms, reason } = this.wait(gate, limit);
+      if (ms <= 0) { gate.sent.push(this.now()); return; }
+      onWait?.({ reason, until: this.now() + ms });
       gate.waiting++;
-      try { await this.sleep(delay, signal); } finally { gate.waiting--; }
+      try { await this.sleep(ms, signal); } finally { gate.waiting--; }
       this.gate(gatewayId);
     }
   }
@@ -79,10 +85,13 @@ export class RateLimiter {
    * pauses for as long as it asked, rather than each request retrying alone.
    */
   cooldown(gatewayId: string, seconds: number): void {
-    const bounded = Math.min(600, Math.max(1, Math.round(Number.isFinite(seconds) ? seconds : 20)));
+    const bounded = boundedCooldown(seconds);
     const gate = this.gate(gatewayId);
     gate.cooldownUntil = Math.max(gate.cooldownUntil, this.now() + bounded * 1000);
   }
+
+  /** When the gateway's 网关冷却 ends, in the limiter's clock; 0 when it never cooled down. */
+  cooldownUntil(gatewayId: string): number { return this.gates.get(gatewayId)?.cooldownUntil ?? 0; }
 
   state(gatewayId: string, limit: number): RateLimitState {
     const gate = this.gate(gatewayId);
@@ -91,14 +100,4 @@ export class RateLimiter {
 
   /** Forgets a gateway that was removed or reconfigured. */
   forget(gatewayId: string): void { this.gates.delete(gatewayId); }
-}
-
-/** Reads `Retry-After`, in seconds or as an HTTP date. */
-export function retryAfterSeconds(headers: Record<string, string> | undefined, now = Date.now()): number | undefined {
-  const raw = headers?.['retry-after'] ?? headers?.['Retry-After'];
-  if (!raw) return undefined;
-  const seconds = Number(raw);
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds;
-  const at = Date.parse(raw);
-  return Number.isFinite(at) ? Math.max(0, Math.round((at - now) / 1000)) : undefined;
 }

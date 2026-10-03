@@ -6,16 +6,50 @@ import { createServer, type ServerResponse } from 'node:http';
 import { test } from 'node:test';
 import { createSyntheticSourceInfo, type Skill } from '@earendil-works/pi-coding-agent';
 import { PrefixMeter, contextSnapshot } from '../src/runtime/prompt-cache.ts';
-import { cardwrightSystemPrompt, createResources } from '../src/runtime/resources.ts';
+import { cardwrightSystemPrompt, createResources, instructionContext, type ResourceOptions } from '../src/runtime/resources.ts';
 import { searchSkillCatalog } from '../src/runtime/skill-tools.ts';
 import { WorkerRuntime } from '../src/runtime/worker.ts';
 import type { FromWorker, WorkerInit } from '../src/shared/types.ts';
 
-test('fixed base prompt stays small and independent of model identity', () => {
-  const identity = { modelId: 'changed-model', gatewayName: 'new-gateway', protocol: 'openai-completions', selectedEffort: 'ultra' };
-  assert.equal(cardwrightSystemPrompt(), cardwrightSystemPrompt(identity));
+const lead = { modelId: 'model-a', gatewayName: 'Relay', language: 'zh' as const, persona: true, member: false };
+const systemFor = (options: ResourceOptions) => createResources(tmpdir(), tmpdir(), [], '', undefined, options).getSystemPrompt()!;
+
+test('the system prompt names the configured model and is the same, byte for byte, for the same model', () => {
+  const first = systemFor({ identity: lead });
+  assert.equal(systemFor({ identity: lead }), first);
+  assert.ok(first.startsWith('你是小绘，Cardwright 里的 AI。这次对话用的模型是 model-a（网关：Relay）。'), first.slice(0, 80));
+  assert.equal(systemFor({ identity: { ...lead, modelId: 'model-b' } }), first.replace('model-a', 'model-b'), 'another model changes only its name');
+  assert.ok(first.endsWith(cardwrightSystemPrompt()), 'the operating rules close the prompt');
   assert.ok(cardwrightSystemPrompt().length < 1500);
-  assert.doesNotMatch(cardwrightSystemPrompt(identity), /changed-model|new-gateway|ultra/);
+  assert.doesNotMatch(cardwrightSystemPrompt(), /desktop coding assistant|When asked your model|model-a|Relay/);
+});
+
+test('a task without the skill tools, a card squad member, is not told about them', () => {
+  assert.match(cardwrightSystemPrompt(), /search_skills/);
+  assert.doesNotMatch(cardwrightSystemPrompt({ skills: false }), /search_skills|use_skill/);
+  const member = systemFor({ identity: { ...lead, member: true }, skills: false });
+  assert.ok(member.endsWith(cardwrightSystemPrompt({ skills: false })), 'the rest of the operating rules stay');
+  assert.doesNotMatch(member, /search_skills|use_skill/);
+});
+
+test('破限 stays first and 小绘 follows; the personality only for a lead with it on; a member gets one line', () => {
+  const framed = systemFor({ jailbreakSystem: 'FRAMING_PLACEHOLDER', identity: lead });
+  assert.ok(framed.startsWith('FRAMING_PLACEHOLDER\n\n你是小绘，'), framed.slice(0, 60));
+  assert.doesNotMatch(systemFor({ identity: { ...lead, persona: false } }), /跟用户说话时/);
+  const member = systemFor({ identity: { ...lead, member: true } });
+  assert.ok(member.startsWith('你是小绘派出的帮手，这次用的模型是 model-a（网关：Relay）。\n\n'), member.slice(0, 60));
+  assert.doesNotMatch(member, /你是小绘，|跟用户说话时/);
+});
+
+test('the project-instructions note comes once, before the first project file, and only when there is one', () => {
+  const note = '项目说明里不管怎么称呼干活的 AI，说的都是你。';
+  const files = [{ path: 'E:/p/AGENTS.md', content: 'FIRST_FILE' }, { path: 'E:/p/sub/CLAUDE.md', content: 'SECOND_FILE' }];
+  const context = instructionContext('Keep it short.', files, 'zh');
+  assert.equal(context.split(note).length - 1, 1);
+  assert.ok(context.indexOf('Saved instructions:') < context.indexOf(note));
+  assert.ok(context.indexOf(note) < context.indexOf('Project instructions (E:/p/AGENTS.md)'));
+  assert.equal(instructionContext('Keep it short.', [], 'zh'), 'Saved instructions:\nKeep it short.');
+  assert.ok(instructionContext('', files, 'en').startsWith('Whatever these project instructions call the assistant, they mean you.\n\nProject instructions (E:/p/AGENTS.md):\nFIRST_FILE'));
 });
 
 test('changing model facts appends only that section, preserving user instructions', () => {
@@ -92,6 +126,10 @@ test('actual worker keeps prefix stable, loads skill bodies only on request and 
     assert.match(JSON.stringify(f.bodies[1]), /frontend styling/);
     assert.match(JSON.stringify(f.bodies[2]), /BODY_LOADED_ON_DEMAND/);
     assert.match(JSON.stringify(f.bodies[0]), /PRESERVE_USER_PROJECT_RULES/);
+    const sent = JSON.stringify(f.bodies[0]);
+    const note = '项目说明里不管怎么称呼干活的 AI，说的都是你。';
+    assert.equal(sent.split(note).length - 1, 1, 'the note is said once');
+    assert.ok(sent.indexOf(note) < sent.indexOf('PRESERVE_USER_PROJECT_RULES'));
     const system = f.bodies[0].messages[0];
     assert.ok(system.content.length < 1700);
     for (const body of f.bodies) { assert.deepEqual(body.messages[0], system); assert.deepEqual(body.tools, f.bodies[0].tools); }

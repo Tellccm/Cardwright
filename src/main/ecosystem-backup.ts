@@ -115,9 +115,9 @@ export function validateBackupData(input: unknown): BackupData {
   const search: SearchConfig = { enabled: flag(rawSearch.enabled, 'search enabled'), provider: choice(rawSearch.provider, ['auto', 'native', 'exa', 'brave', 'searxng'], 'search provider'), baseUrl: safeUrl(rawSearch.baseUrl, true), hasKey: false };
   const eco = object(data.ecosystem, 'ecosystem'); keys(eco, ['memoryEnabled', 'cacheEnabled', 'showStatusline', 'compactTools', 'roles', 'mcpServers'], 'ecosystem');
   const roles: AgentRole[] = unique(list(eco.roles, 100, 'roles').map(value => {
-    const role = object(value, 'role'); keys(role, ['id', 'name', 'prompt', 'readOnly', 'builtIn'], 'role');
+    const role = object(value, 'role'); keys(role, ['id', 'name', 'prompt', 'readOnly', 'builtIn', 'description'], 'role');
     return { id: identifier(role.id, 'role ID'), name: text(role.name, 200, 'role name'), prompt: text(role.prompt, 100_000, 'role instructions'), readOnly: flag(role.readOnly, 'role read-only'),
-      ...(role.builtIn !== undefined ? { builtIn: flag(role.builtIn, 'built-in role') } : {}) };
+      ...(role.builtIn !== undefined ? { builtIn: flag(role.builtIn, 'built-in role') } : {}), ...(role.description !== undefined ? { description: text(role.description, 300, 'role description') } : {}) };
   }), role => role.id, 'role IDs');
   const mcpServers: McpServerConfig[] = unique(list(eco.mcpServers, 100, 'MCP servers').map(value => {
     const mcp = object(value, 'MCP server'); keys(mcp, ['id', 'name', 'enabled', 'transport', 'command', 'args', 'url', 'hasSecrets'], 'MCP server');
@@ -188,7 +188,8 @@ export class ConfigBackup {
       reasoning: g.reasoning, contextWindow: g.contextWindow, maxTokens: g.maxTokens, hasKey: false, models: JSON.parse(this.redact(JSON.stringify(gatewayModels(g)))), ...(g.effortMap ? { effortMap: g.effortMap } : {}), ...(g.adaptiveThinking !== undefined ? { adaptiveThinking: g.adaptiveThinking } : {}),
       ...(g.nativeSearch ? { nativeSearch: { enabled: g.nativeSearch.enabled, ...(g.nativeSearch.responsesUrl ? { responsesUrl: sanitizedUrl(this.redact(g.nativeSearch.responsesUrl)) } : {}) } } : {}) }));
     const search = { ...snapshot.search, baseUrl: sanitizedUrl(this.redact(snapshot.search.baseUrl)), hasKey: false };
-    const roles = snapshot.ecosystem.roles.map(role => ({ id: role.id, name: this.redact(role.name), prompt: this.redact(role.prompt), readOnly: role.readOnly, ...(role.builtIn !== undefined ? { builtIn: role.builtIn } : {}) }));
+    // Only the subagents saved in Cardwright: the ones read from .claude/agents folders live in those folders, and their ids are not backup ids.
+    const roles = snapshot.ecosystem.roles.filter(role => role.source !== 'project' && role.source !== 'user').map(role => ({ id: role.id, name: this.redact(role.name), prompt: this.redact(role.prompt), readOnly: role.readOnly, ...(role.builtIn !== undefined ? { builtIn: role.builtIn } : {}), ...(role.description ? { description: this.redact(role.description) } : {}) }));
     const mcpServers = snapshot.ecosystem.mcpServers.map(server => {
       const args: string[] = [];
       for (let index = 0; index < (server.args?.length ?? 0); index++) {

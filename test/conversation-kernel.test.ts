@@ -27,3 +27,20 @@ test('consecutive calls of one tool fold into a group; thinking between them rid
   assert.deepEqual(runs, ['read:1234/3', '5', '6', 'read:78/2', '9']);
   assert.equal(toolGroupLabel('read', 3, (_en, zh) => zh), '读取 3 个文件');
 });
+
+test('runs of squad tool calls are named for what they did, 1.2 histories included', () => {
+  const zh = (_en: string, value: string) => value;
+  assert.equal(toolGroupLabel('dispatch_member', 3, zh), '派出 3 名成员');
+  assert.equal(toolGroupLabel('agent', 2, zh), '派出 2 名成员');
+  assert.equal(toolGroupLabel('dispatch_team', 2, zh), '派出 2 支小队');
+  assert.equal(toolGroupLabel('agent_team', 2, zh), '派出 2 支小队');
+  assert.equal(toolGroupLabel('member_result', 4, zh), '查看成员结果 4 次');
+  assert.equal(toolGroupLabel('get_subagent_result', 4, zh), '查看成员结果 4 次');
+  assert.equal(toolGroupLabel('message_member', 2, zh), '给成员发消息 2 次');
+  assert.equal(toolGroupLabel('steer_subagent', 2, zh), '给成员发消息 2 次');
+});
+
+test('a run of dispatch registrations is named for what it did, not as an unknown tool', () => {
+  assert.equal(toolGroupLabel('card_add_dispatches', 3, (_en, zh) => zh), '登记派单 · 3 次');
+  assert.equal(toolGroupLabel('card_add_dispatches', 3, en => en), 'Registered dispatches · 3 times');
+});

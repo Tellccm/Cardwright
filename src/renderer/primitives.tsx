@@ -1,6 +1,7 @@
-import { useEffect, useId, useRef, useState, type ReactNode, type ButtonHTMLAttributes } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type ButtonHTMLAttributes, type CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
 import { X, Check, ChevronDown } from 'lucide-react';
+import { placePopover } from './popover-position';
 
 /** Chamfered signal tile with an angular C; scripts/build.mjs mirrors this geometry for the app icons. */
 export const MARK_TILE = 'M16 4H60V48L48 60H4V16Z';
@@ -36,8 +37,16 @@ export function Modal({ title, children, onClose, className = '', labelled = tru
     <h2 id={id} className={labelled ? 'modal-title' : 'sr-only'}>{title}</h2><IconButton label="Close / 关闭" className="modal-close" onClick={onClose}><X size={21} /></IconButton>{children}
   </div></div>, document.body);
 }
-export function Popover({ label, trigger, children, className = '', align = 'left' }: { label: string; trigger: ReactNode; children: ReactNode | ((close: () => void) => ReactNode); className?: string; align?: 'left' | 'right' }) {
-  const [open, setOpen] = useState(false); const root = useRef<HTMLDivElement>(null); const button = useRef<HTMLButtonElement>(null); const id = useId();
+/** Inline, so no context rule (`.composer-footer .popover { bottom: … }`) can pull a floating panel off its spot. */
+const FLOATING: CSSProperties = { position: 'fixed', right: 'auto', bottom: 'auto', margin: 0 };
+/**
+ * `floating` puts the open panel in the browser's top layer (a manual popover), so no scrolling column or dialog can
+ * clip it, and places it beside its button inside the window, following the button through scrolling and resizing.
+ * The panel keeps its place in the page, so the studio's colours, click-outside and the tab order stay as they were;
+ * when its button is no longer shown (its column hidden by a narrow window), the panel closes.
+ */
+export function Popover({ label, trigger, children, className = '', align = 'left', floating = false }: { label: string; trigger: ReactNode; children: ReactNode | ((close: () => void) => ReactNode); className?: string; align?: 'left' | 'right'; floating?: boolean }) {
+  const [open, setOpen] = useState(false); const root = useRef<HTMLDivElement>(null); const button = useRef<HTMLButtonElement>(null); const panel = useRef<HTMLDivElement>(null); const id = useId();
   useEffect(() => {
     if (!open) return;
     function outside(e: PointerEvent) { if (!root.current?.contains(e.target as Node)) setOpen(false); }
@@ -45,7 +54,23 @@ export function Popover({ label, trigger, children, className = '', align = 'lef
     document.addEventListener('pointerdown', outside); document.addEventListener('keydown', key, true);
     return () => { document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', key, true); };
   }, [open]);
-  return <div ref={root} className={`popover-root ${className}`}><button ref={button} type="button" className="popover-trigger" aria-label={label} aria-expanded={open} aria-controls={open ? id : undefined} onClick={() => setOpen(!open)}>{trigger}</button>{open && <div id={id} className={`popover popover-${align}`} role="group" aria-label={label}>{typeof children === 'function' ? children(() => { setOpen(false); button.current?.focus(); }) : children}</div>}</div>;
+  useLayoutEffect(() => {
+    const box = panel.current;
+    if (!open || !floating || !box) return;
+    if (!box.matches(':popover-open')) box.showPopover();
+    function place() {
+      const anchor = button.current;
+      if (!box || !anchor?.getClientRects().length) { setOpen(false); return; }
+      const spot = placePopover(anchor.getBoundingClientRect(), { width: box.offsetWidth, height: box.offsetHeight }, { width: window.innerWidth, height: window.innerHeight }, { align });
+      box.style.left = `${spot.left}px`; box.style.top = `${spot.top}px`;
+    }
+    place();
+    // The panel changes size as the user filters or opens a gateway; the button moves when anything around it scrolls.
+    const resized = new ResizeObserver(place); resized.observe(box);
+    window.addEventListener('resize', place); document.addEventListener('scroll', place, true);
+    return () => { resized.disconnect(); window.removeEventListener('resize', place); document.removeEventListener('scroll', place, true); };
+  }, [open, floating, align]);
+  return <div ref={root} className={`popover-root ${className}`}><button ref={button} type="button" className="popover-trigger" aria-label={label} aria-expanded={open} aria-controls={open ? id : undefined} onClick={() => setOpen(!open)}>{trigger}</button>{open && <div ref={panel} id={id} popover={floating ? 'manual' : undefined} style={floating ? FLOATING : undefined} className={`popover popover-${align}`} role="group" aria-label={label}>{typeof children === 'function' ? children(() => { setOpen(false); button.current?.focus(); }) : children}</div>}</div>;
 }
 export function MenuItem({ children, selected, onClick, disabled = false, className = '' }: { children: ReactNode; selected?: boolean; onClick: () => void; disabled?: boolean; className?: string }) {
   return <button className={`menu-item ${className}`} type="button" disabled={disabled} aria-pressed={selected} onClick={onClick}><span>{children}</span>{selected && <Check size={16} className="selected-check" />}</button>;

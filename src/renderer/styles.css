@@ -351,6 +351,8 @@ html[data-motion="reduced"] *, html[data-motion="reduced"] *::before, html[data-
 .ecosystem-config-list h4 { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; font-weight: 600; }
 .ecosystem-config-list p { color: var(--muted); font-size: 12px; line-height: 1.7; margin-top: 7px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .ecosystem-config-list small { display: block; color: var(--success); font-size: 10px; margin-top: 5px; }
+.ecosystem-config-list small.agent-note { color: var(--muted); }
+.ecosystem-config-list small.agent-warning { color: var(--warning); }
 .ecosystem-row-actions { display: flex; align-items: center; gap: 3px; flex-shrink: 0; }
 .ecosystem-row-actions .toggle { margin-right: 6px; }
 .private-config { font-family: var(--font-mono); font-size: 11px !important; }

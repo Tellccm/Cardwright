@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { dispatchKey, formatDispatch, messageStartsDispatch, parseDispatches } from '../src/shared/card-studio/dispatch.ts';
+import { DISPATCH_BATCH_LIMIT, dispatchKey, formatDispatch, mayAddDispatches, messageStartsDispatch, parseDispatches, planDispatchBatch } from '../src/shared/card-studio/dispatch.ts';
 import { SECTION_IDS, SECTION_ORDER, boardOf, findBoard, sectionFromTarget, sectionLabel, sortByDependency, targetOf } from '../src/shared/card-studio/boards.ts';
 
 const fence = '```';
@@ -89,4 +89,59 @@ test('改动派单 go in the sections\' dependency order: ties keep their order,
   assert.deepEqual(sortByDependency(items).map(item => item.title), ['叙事规则', '变量表', '变量条目甲', '变量条目乙', '正文美化', '创角页', '开场白', '未知', '别处']);
   assert.equal(items[0].title, '开场白', 'the input is left as it was');
   assert.deepEqual([...SECTION_ORDER].sort(), SECTION_IDS.filter(id => id !== 'source').sort(), 'every section with conversations has a place');
+});
+
+// §5.6: card_add_dispatches checks each item the way a 派单 block is parsed, and answers for every item.
+test('a batch from the tool is checked item by item, against the card and against itself', () => {
+  assert.equal(DISPATCH_BATCH_LIMIT, 12, '§5.6: 1 to 12 at a time');
+  const existing = [{ target: '世界书/人设', sectionId: 'lore-people', title: '写人物模板' }];
+  const { accepted, results } = planDispatchBatch(existing, [
+    { target: '世界书 / 叙事规则', title: ' 写叙事规则 ', prerequisite: '设计书已确认', body: '写四条叙事规则。\n' },
+    { target: '世界书/人设', title: '写人物模板', body: '又来一次' },
+    { target: '世界书/人物', title: '写点什么', body: '正文' },
+    { target: '规划', title: '再规划一次', body: '正文' },
+    { title: '没有目标', body: '正文' },
+    { target: '开场白', title: '', body: '正文' },
+    { target: '开场白', title: '写开场白', body: '两条普通开场白。' },
+    { target: '开场白/开场白', title: '写开场白', body: '同一个分区的另一种写法' },
+    { target: '世界书/设定', title: '写设定\n第二行', body: '' },
+    '不是对象',
+  ]);
+  assert.deepEqual(accepted.map(item => [item.sectionId, item.title, item.requires, item.body]), [
+    ['lore-rules', '写叙事规则', '设计书已确认', '写四条叙事规则。'],
+    ['greet', '写开场白', '', '两条普通开场白。'],
+    ['lore-setting', '写设定 第二行', '', ''],
+  ]);
+  assert.deepEqual(results.map(item => item.index), [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+  assert.deepEqual(results.map(item => item.ok), [true, false, false, false, false, false, true, false, true, false]);
+  assert.equal(results[0].target, '世界书/叙事规则');
+  assert.equal(results[0].section, '世界书 · 叙事规则');
+  assert.match(results[1].error ?? '', /已经有一条叫「写人物模板」的派单/);
+  assert.match(results[2].error ?? '', /不是能派单的分区/);
+  assert.match(results[2].error ?? '', /世界书\/人设/, 'the refusal lists the targets that work');
+  assert.match(results[3].error ?? '', /不是能派单的分区/, 'planning does not dispatch to itself');
+  assert.equal(results[4].error, '派单缺少目标');
+  assert.equal(results[5].error, '派单缺少标题');
+  assert.match(results[7].error ?? '', /已经有一条叫「写开场白」的派单/, 'the same section under another spelling is the same dispatch');
+  assert.equal(results[9].error, '派单缺少目标');
+});
+
+test('only planning that starts or refines a card registers dispatches by tool', () => {
+  assert.equal(mayAddDispatches({ sectionId: 'plan', mode: 'scratch' }), true);
+  assert.equal(mayAddDispatches({ sectionId: 'plan', mode: 'refine' }), true);
+  assert.equal(mayAddDispatches({ sectionId: 'plan', mode: 'change' }), false, 'the change AI\'s 派单 blocks are its 影响清单');
+  assert.equal(mayAddDispatches({ sectionId: 'plan', mode: 'scratch', member: true }), false, 'squad members never register');
+  assert.equal(mayAddDispatches({ sectionId: 'lore-people' }), false);
+  assert.equal(mayAddDispatches(undefined), false);
+});
+
+test('a body that quotes a code block keeps it: the dispatch gets a longer fence', () => {
+  const original = { target: '脚本/变量结构', title: '写变量表', requires: '', body: '变量表照这个开头：\n```yaml\n版本: 1\n```\n其余按设计书。' };
+  const text = formatDispatch(original);
+  assert.ok(text.startsWith('````派单\n'), text);
+  const [parsed] = parseDispatches(text);
+  assert.ok(!('error' in parsed));
+  assert.equal(parsed.body, original.body);
+  assert.equal(messageStartsDispatch(text, original), true);
+  assert.ok(formatDispatch({ ...original, body: '没有代码块。' }).startsWith('```派单\n'), 'an ordinary body keeps the usual fence');
 });

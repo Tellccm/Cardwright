@@ -239,3 +239,14 @@ test('merge rejects running tasks, a different parent branch, and an advanced pa
   await assert.rejects(mergeWorktree(project, isolated), /advanced/);
   assert.equal(await readFile(join(project.path, 'tracked.txt'), 'utf8'), 'original\n');
 });
+
+test('网络状态 belongs to a request in flight: it is never saved and never comes back after a restart', async t => {
+  const directory = await fixture(t);
+  await writeFile(join(directory, 'state.json'), JSON.stringify({ schemaVersion: 8, tasks: [task({ net: { state: 'cooldown', until: Date.now() + 30_000 } })] }));
+  const store = new AppStore(directory);
+  assert.equal(store.state.tasks[0].net, undefined, 'a file that holds one loads without it');
+  store.state.tasks[0].net = { state: 'queued', until: Date.now() + 5_000 };
+  store.save();
+  assert.equal(JSON.parse(await readFile(store.filePath, 'utf8')).tasks[0].net, undefined);
+  assert.equal(store.state.tasks[0].net?.state, 'queued', 'the live task keeps it while its request waits');
+});

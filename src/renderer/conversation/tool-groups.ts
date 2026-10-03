@@ -44,6 +44,12 @@ export function toolGroupLabel(name: string, count: number, t: (english: string,
     case 'web_search': return t(`Searched the web ${count} times`, `联网搜索 ${count} 次`);
     case 'fetch_content': return t(`Read ${count} pages`, `读取 ${count} 个网页`);
     case 'card_search_sources': return t(`Searched the sources ${count} times`, `检索资料 ${count} 次`);
+    case 'card_add_dispatches': return t(`Registered dispatches · ${count} times`, `登记派单 · ${count} 次`);
+    // The squad tools under their 1.3 names and, in older task histories, their 1.2 ones.
+    case 'dispatch_member': case 'agent': return t(`Dispatched ${count} members`, `派出 ${count} 名成员`);
+    case 'dispatch_team': case 'agent_team': return t(`Dispatched ${count} squads`, `派出 ${count} 支小队`);
+    case 'member_result': case 'get_subagent_result': return t(`Checked members ${count} times`, `查看成员结果 ${count} 次`);
+    case 'message_member': case 'steer_subagent': return t(`Messaged members ${count} times`, `给成员发消息 ${count} 次`);
     default: return t(`${name} · ${count} calls`, `${name} · ${count} 次调用`);
   }
 }

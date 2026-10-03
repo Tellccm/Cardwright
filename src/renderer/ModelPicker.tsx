@@ -9,7 +9,7 @@ export function ModelPicker({ gatewayId, modelId, disabled = false, onChange }: 
   const { data, t } = useApp();
   const gateway = data.gateways.find(item => item.id === gatewayId);
   const model = selectedModel(gateway, modelId);
-  return <Popover label={t('Choose model', '选择模型')} align="right" className="model-picker" trigger={<><small className="module-label">{t('Model', '模型')}</small><span className="selected-model-label" title={gateway ? `${gateway.name} / ${model?.modelId || modelId || ''}` : undefined}>{model?.modelId || modelId || t('Connect a model', '连接模型')}</span>{modelId && !model && <small className="model-unavailable">{t('Unavailable', '不可用')}</small>}<ChevronDown size={12} /></>}>{close => <ModelMenu gatewayId={gatewayId} modelId={model?.modelId || modelId} disabled={disabled} close={close} onChange={onChange} />}</Popover>;
+  return <Popover label={t('Choose model', '选择模型')} align="right" floating className="model-picker" trigger={<><small className="module-label">{t('Model', '模型')}</small><span className="selected-model-label" title={gateway ? `${gateway.name} / ${model?.modelId || modelId || ''}` : undefined}>{model?.modelId || modelId || t('Connect a model', '连接模型')}</span>{modelId && !model && <small className="model-unavailable">{t('Unavailable', '不可用')}</small>}<ChevronDown size={12} /></>}>{close => <ModelMenu gatewayId={gatewayId} modelId={model?.modelId || modelId} disabled={disabled} close={close} onChange={onChange} />}</Popover>;
 }
 
 function ModelMenu({ gatewayId, modelId, disabled, close, onChange }: { gatewayId: string; modelId?: string; disabled: boolean; close: () => void; onChange: (gatewayId: string, modelId: string) => void | Promise<unknown> }) {

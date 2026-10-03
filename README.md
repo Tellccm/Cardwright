@@ -18,7 +18,7 @@ Cardwright 是面向 Windows 本地项目的 Agent 工作台：连接你自己�
 
 ### 安装
 
-从 [Releases](../../releases) 下载 `Cardwright-Setup-1.2.0.exe` 并安装。安装包没有代码签名，Windows 首次运行会提示「未知发布者」，可以选择「更多信息 → 仍要运行」。卸载时保留你的资料目录。
+从 [Releases](../../releases) 下载 `Cardwright-Setup-1.3.0.exe` 并安装。安装包没有代码签名，Windows 首次运行会提示「未知发布者」，可以选择「更多信息 → 仍要运行」。卸载时保留你的资料目录。
 
 也可以自己构建：
 
@@ -43,12 +43,14 @@ node scripts/package.mjs      # 便携版输出到 release/<版本>/Cardwright-w
 - **右栏**是可拆分的面板：文件、改动、检查、终端、浏览器、计划、待办。窗口窄于 960px 时左栏收成图标列，右栏变成覆盖在对话上的抽屉。
 - **斜杠命令**：`/clear`、`/compact`、`/context`、`/cost`、`/model`、`/resume`、`/rewind`、`/init`、`/help`、`/plan`、`/todos`、`/memory`、`/dream`，以及你的技能。
 - **Shift+Tab** 在默认审批 → 项目内自动编辑 → 计划 → 完全访问之间循环。
-- **子代理**：除了自建的，还会读项目和用户的 `.claude/agents/*.md`，可以逐个停用。
+- **子代理**：自建的和用户目录里的 `.claude/agents/*.md` 默认可用；项目文件夹里读到的默认关闭，确认内容可信后在设置里打开。打开的子代理主代理都能派，文件里的 `model:` 不起作用，在设置里给它选模型。
+- **小绘**：内置 AI 叫小绘。问它用的是什么模型，它会说出你配置的模型和网关，并说明网关后面实际接的是哪个它核实不了。说话的性格可以在「头像与外观」里关掉。
 - **钩子**：按 Claude Code 的 `settings.json` 格式配置 SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、Stop、SubagentStop、Notification，可以从 Claude Code 导入并逐条试跑。
 - **对话**（工作台和制卡工坊都是）：代码块有语法高亮、语言标签和复制，长代码自动折叠；模型的思考过程边想边显示，想完折成「思考了 N 秒」；连续的同类工具调用合成一行；回复末尾有光标，新字淡入，滚动平滑跟随；表格有斑马纹，太宽时横向滚动。系统开了「减少动画」时这些都不动。
 - **新版本提醒**：每天查一次 GitHub 上的最新版本号，有新版本时在顶栏提示，点一下打开发布页；不下载、不上传任何东西，可以在「工作室设置」里关掉。
 - **上游服务商**：网关可以指明地址背后真正处理请求的服务（OpenAI、英伟达 NIM、DeepSeek、OpenRouter、智谱、Moonshot、Together、xAI、Cerebras 等）。接本地中转或轮询时自动识别会失效，指明之后就按那家服务接受的参数发送；认不出的地址只发通用参数。
 - **每分钟请求上限**：每个网关可选，默认关。任意 60 秒内算一次，这个网关下所有任务、小队成员和重试都算在内，超出的请求在本机排队，状态栏显示本分钟用了多少。服务器回 429 时整个网关按它给的时间一起暂停。重试次数也可以改。
+- **中转站不稳时**：网关可以设「无响应断开」（填秒数，15–300，默认关）：一次请求超过这个秒数没有收到任何数据（包括回复到一半停住），就断开并重试；模型长时间思考不出字时可能被误判，按你的中转站来设。中转站常见的临时报错（繁忙、超时、上游错误之类）也会自动重试，密钥、额度和请求本身的错误不会。重试次数、每分钟请求上限和上游服务商保存后重启也不会丢。服务器回 429 时，这个网关按它给的时间暂停。排队、冷却、重试都会显示出来：工作台在状态栏，制卡工坊在输入框上方。
 - **请求诊断**：请求失败时，错误卡片上可以看到实际发出的参数、工具名、各角色的消息条数、HTTP 状态和关键响应头。不含对话正文、工具参数和密钥，可以直接贴给别人看。
 - **删除对话**：左栏、任务菜单、已归档列表都能删，按住 Ctrl 或 Shift 可以多选。删除会连带子任务、小队成员、会话文件和检查点；项目文件、项目记忆和每天的 Token 统计不受影响。
 - **导出为 Markdown**：把一段对话连同思考过程和工具调用导出成一个文件。
@@ -83,6 +85,8 @@ node scripts/package.mjs      # 便携版输出到 release/<版本>/Cardwright-w
 - **质量检查**：手机宽度下横向滚动、没有任何交互反馈、正文对比度不足、直接引用 Google 字体、塞了大图 base64、会卡死的正则会禁止导出；设计令牌太少、没有 `@media`、循环动画不照顾「减少动画」、强调色用得太多、字体镜像与外链素材、在安卓上表现不同的正则写法会提醒。
 - **一处提改动**：点卡项目主页的「提改动」，或在任意分区输入 `/改动`：一句话说要改什么，或者贴一段酒馆里的报错，AI 读整张卡列出影响清单；删掉不要的条目，点「照单开做」，应用按分区的先后顺序一口气改完，再跑拼装检查。只动一个文件时直接改好，可以撤销。没有设计书的卡也能用。
 - **导入更顺**：导入时先看条目名里的标记（`[initvar]`、人物总览、地点总览等）再看编号来分区；未分类的条目可以多选后一起移到分区，也可以点「AI 归类建议」，确认之后才搬。
+- **小队**：「工作室设置 → 制卡」里的「子代理」可以设成关、只读或可写（默认关）。打开后规划和分区可以派成员分头做：只读时派「查资料」，可写时再加「写组件」。写组件只能改分给它的组件，人物总览、出处索引、设计书、变量表只由主 AI 改；成员写的文件算进本轮写入，可以一起撤销。「自行组队」决定由 AI 自己判断什么时候派，还是只在你要求时派。
+- **分批写**：分区 AI 一次只写一个组件文件，规划分批登记派单；一键制作遇到还没写完的派单会接着做完（一条派单最多自动接 20 轮，之后停下来等你点【继续】）。
 - 说错了话可以撤回：AI 还在写时，撤回会停下这一轮、把这条消息收回，文字放回输入框，它发出的派单回到「未派」；已经写完的消息可以编辑后重新生成，产生新的对话版本。写进卡项目的文件不跟着回滚，要退文件用「本轮写入」里的【撤销本轮】。
 - 工坊的标题和正文用内置的开源宋体（Noto Serif SC 的子集），每台电脑上看起来都一样。
 
@@ -133,7 +137,7 @@ The interface stays quiet, deterministic rules are executed by the program, and 
 
 ### Install
 
-Download `Cardwright-Setup-1.2.0.exe` from [Releases](../../releases). The installer is not code-signed, so Windows shows an "unknown publisher" warning the first time; choose "More info → Run anyway". Uninstalling keeps your data directory.
+Download `Cardwright-Setup-1.3.0.exe` from [Releases](../../releases). The installer is not code-signed, so Windows shows an "unknown publisher" warning the first time; choose "More info → Run anyway". Uninstalling keeps your data directory.
 
 Or build it yourself:
 
@@ -158,12 +162,14 @@ node scripts/package.mjs      # portable output in release/<version>/Cardwright-
 - **Right**: a splittable panel — files, changes, checks, terminal, browser, plan, todos. Under 960px the sidebar becomes an icon column and the panel slides over the conversation.
 - **Slash commands**: `/clear`, `/compact`, `/context`, `/cost`, `/model`, `/resume`, `/rewind`, `/init`, `/help`, `/plan`, `/todos`, `/memory`, `/dream`, and your skills.
 - **Shift+Tab** cycles ask → auto-edit in project → plan → full access.
-- **Subagents**: your own, plus whatever `.claude/agents/*.md` holds in the project and in your home directory; each can be switched off.
+- **Subagents**: your own, and the ones in `.claude/agents/*.md` in your home folder, are on from the start; ones found in a project folder start off, so turn one on in settings once you trust its file. The lead can send any subagent that is on. A file's `model:` line has no effect; pick the model for it in settings.
+- **小绘**: the AI built into Cardwright is called 小绘. Ask which model it runs on and it names the model and the gateway you configured, and says it cannot verify which model actually sits behind the gateway. Its way of talking can be switched off under Profile & appearance.
 - **Hooks**: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStop and Notification, configured in Claude Code's `settings.json` shape, importable from Claude Code and testable one by one.
 - **Conversation** (in the workbench and the card studio alike): code blocks are syntax-highlighted with a language label and a copy button, and long ones fold; the model's thinking shows as it happens and folds to "Thought for N s" when done; consecutive calls of the same tool fold into one row; a reply ends in a cursor while it writes, new text fades in and scrolling follows smoothly; tables are striped and scroll sideways when wide. Under reduced motion none of it moves.
 - **New version reminder**: once a day Cardwright reads the latest version number on GitHub; when there is a newer one, the top bar says so and opens the release page on a click. Nothing is downloaded or uploaded, and Studio settings can turn it off.
 - **Upstream service**: a gateway can name the service that actually answers behind its address (OpenAI, NVIDIA NIM, DeepSeek, OpenRouter, Z.ai, Moonshot, Together, xAI, Cerebras and others). A local relay or proxy defeats detection; naming the service sends the fields that service accepts, and an unrecognised address receives only widely accepted ones.
 - **Requests per minute**: optional per gateway, off by default. Counted over any rolling 60 seconds across every task, squad member and retry on that gateway; a request over the limit waits on this computer and the status line shows how full the minute is. A 429 pauses the whole gateway for as long as the service asks. The retry count is configurable too.
+- **When a relay is unstable**: a gateway can set Disconnect when silent (seconds, 15 to 300, off by default): a request that receives no data for longer than that, even halfway through a reply, is cut off and retried. A model that thinks for a long time without streaming any output can be mistaken for a stall, so set it to suit your relay. A relay's usual temporary errors (busy, timed out, upstream error and the like) are retried automatically; a wrong key, an empty balance or a bad request is not. The retry count, the requests-per-minute limit and the upstream service are kept across restarts. When the server answers 429, that gateway pauses for as long as it asks. Waiting in the queue, cooling down and retrying all show on screen: in the status line in the workbench, above the composer in the card studio.
 - **Request diagnostic**: when a request fails, the error card shows the parameters that went out, the tool names, how many messages of each role, the HTTP status and the response headers worth reading. It holds no message text, no tool arguments and no credential, so it can be pasted into a bug report as it stands.
 - **Delete conversations**: from the session list, the task menu or the archived list, with Ctrl or Shift for several at once. Deleting takes sub-tasks, squad members, session files and checkpoints; project files, project memory and daily token totals are untouched.
 - **Export as Markdown**: a conversation, its thinking and its tool calls as one file.
@@ -198,6 +204,8 @@ Enter from the bottom of the sidebar. A card project is a local folder and appea
 - **Quality checks**: horizontal scrolling at phone width, no interaction feedback at all, body text below 4.5:1, Google's own font links, big base64 images and regexes that can hang block the export; too few design tokens, no `@media`, looping motion that ignores reduced motion, an overused accent, font mirrors and external media, and regex writings that behave differently on Android are warnings.
 - **Change it in one place**: Ask for a change on the card project home, or type `/改动` in any section: say in a sentence what to change, or paste an error from SillyTavern, and the AI reads the whole card and lists what the change affects. Take out what you do not want, press Go ahead, and the application works through the sections in dependency order and runs the assembly checks. A change to a single file is made directly and can be undone. Cards without a design document work too.
 - **Smoother imports**: entries are sorted by the markers in their names first (`[initvar]`, character and place overviews and the like) and by their order number second; unclassified entries can be moved to a section several at a time, or you can ask for AI suggestions and confirm them before anything moves.
+- **Squads**: the "Sub-agents" setting under Studio settings → Card studio can be Off, Read only or Can write (off by default). When it is on, planning and the section AIs can send members to work in parallel: 查资料 (research) when it is Read only, 写组件 (write a component) as well when it can write. A 写组件 member can change only the components it was given; the character overview, the source index, the design document and the variable table stay with the main AI. What the members write counts in the turn's writes and is undone together with them. "Self-organised squads" decides whether the AI judges when to send members, or sends them only when you ask.
+- **Batched writing**: a section AI writes one component file per request, and planning registers its dispatches a board at a time. One-click making carries on with a dispatch that is not finished yet (at most 20 rounds for one dispatch, then it stops and waits for you to press Continue).
 - A message can be withdrawn: while the AI is still writing, withdrawing stops the turn, takes the message back, returns its text to the composer and puts a dispatch it sent back to not sent. A finished message can be edited and regenerated into a new conversation version. Files already written stay as they are; use Undo this turn in the turn's writes to take them back.
 - The studio's headings and text use a bundled open-source serif (a subset of Noto Serif SC), so it looks the same on every computer.
 

@@ -1,10 +1,17 @@
 import type { AgentRole, EcosystemConfig, ExtensionInfo, SearchConfig } from '../shared/types.ts';
 
+/** 1.3.0 §5.1: Cardwright's own roles under its own ids, named by their 界面名; the 1.2 ids read through canonicalRoleId. */
 export const BUILTIN_ROLES: AgentRole[] = [
-  { id: 'general-purpose', name: 'General purpose', prompt: 'Handle the assigned task completely, using the provided tools and reporting verification.', readOnly: false, builtIn: true },
-  { id: 'Explore', name: 'Explore', prompt: 'Explore the repository and report evidence. Do not change project files.', readOnly: true, builtIn: true },
-  { id: 'Plan', name: 'Plan', prompt: 'Investigate requirements and propose an implementation plan. Do not change project files.', readOnly: true, builtIn: true },
+  { id: 'executor', name: '执行员', description: '通用执行', prompt: 'Handle the assigned task completely, using the provided tools and reporting verification.', readOnly: false, builtIn: true },
+  { id: 'explorer', name: '探索员', description: '查看项目、交回发现', prompt: 'Explore the repository and report evidence. Do not change project files.', readOnly: true, builtIn: true },
+  { id: 'planner', name: '规划师', description: '规划，进入规划模式', prompt: 'Investigate requirements and propose an implementation plan. Do not change project files.', readOnly: true, builtIn: true },
 ];
+/**
+ * The Dreamer's own definition (整理记忆). It is not one of the roles the user switches, replaces or picks, so turning the 探索员
+ * off or putting a file in its place neither stops the Dreamer nor changes what it does. It only reads, as the Dreamer always did.
+ * The id has a colon, which no role made in settings and no subagent file (`agent:…`) can have.
+ */
+export const DREAMER_ROLE: AgentRole = { id: 'app:dreamer', name: 'Dreamer', description: '整理项目记忆', prompt: 'Role: Dreamer. You organize the memory of this project. Inspect and report; do not change project files.', readOnly: true };
 export function defaultEcosystem(): EcosystemConfig {
   return { memoryEnabled: true, cacheEnabled: true, showStatusline: true, compactTools: true, roles: structuredClone(BUILTIN_ROLES), mcpServers: [], webdav: { url: '', username: '', hasPassword: false } };
 }

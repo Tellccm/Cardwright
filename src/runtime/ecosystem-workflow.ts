@@ -3,7 +3,9 @@ import { dirname, join } from 'node:path';
 import { defineTool, type ExtensionContext, type ToolDefinition } from '@earendil-works/pi-coding-agent';
 import { Type, type TSchema } from 'typebox';
 import { chapterTitle } from '../shared/chapters.ts';
+import { DISPATCH_BATCH_LIMIT } from '../shared/card-studio/dispatch.ts';
 import type { AgentRole, Interaction, TodoItem, UserQuestion } from '../shared/types.ts';
+import { canonicalRoleId, type RoleSummary } from '../shared/agents.ts';
 import { resolveEcosystemPackage } from './ecosystem-skills.ts';
 
 type Result = { content: Array<{ type: 'text'; text: string }>; details: unknown; terminate?: boolean };
@@ -18,9 +20,11 @@ export interface WorkflowOptions {
   agents: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
   wait: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
   steer: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
-  canDelegate: boolean; roles: AgentRole[]; isPlanMode: () => boolean;
+  canDelegate: boolean; roles: RoleSummary[]; isPlanMode: () => boolean;
+  /** The lead's 成员额度, as the app holds it: how many members it may have at once. The dispatch tools say so. */
+  squadSize: number;
   /** Present only in card studio section conversations. */
-  card?: { newComponent: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>; check: (signal?: AbortSignal) => Promise<unknown>; syncVariables: (signal?: AbortSignal) => Promise<unknown>; searchSources: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown> };
+  card?: { newComponent: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>; check: (signal?: AbortSignal) => Promise<unknown>; syncVariables: (signal?: AbortSignal) => Promise<unknown>; searchSources: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>; /** Planning that starts or refines a card: card_add_dispatches (§5.6). */ addDispatches?: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown> };
   /** Present only in workbench tasks; card studio conversations have no browser. */
   browser?: (action: string, args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
 }
@@ -30,6 +34,15 @@ export interface WorkflowOptions {
  */
 export const BROWSER_READS = ['browser_read', 'browser_structure', 'browser_find', 'browser_screenshot', 'browser_console', 'browser_network'];
 export const BROWSER_TOOLS = [...BROWSER_READS, 'browser_open', 'browser_click', 'browser_type'];
+/** The squad tools by the names the model sees (1.3.0 §5.2). Task histories from 1.2 keep the old names as recorded. */
+export const MEMBER_TOOLS: readonly string[] = ['dispatch_member', 'dispatch_team', 'member_result', 'message_member'];
+/** The ones that start or steer a member; none of them may run while a lead sums up its squad's final reports. */
+export const DISPATCH_TOOLS: readonly string[] = ['dispatch_member', 'dispatch_team', 'message_member'];
+
+/** The role list in the dispatch tools' descriptions, one line each: `编号`（界面名）：一句说明 (§5.2). The caller picks the roles. */
+export function describeRoles(roles: { id: string; label: string; description: string; readOnly: boolean }[]): string {
+  return roles.map(role => `- \`${role.id}\`（${role.label}）：${role.description.replace(/[。.]\s*$/, '')}${role.readOnly ? '；只读' : ''}`).join('\n');
+}
 const textResult = (value: unknown): Result => ({ content: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }], details: value });
 
 /** Field names and constraints are the contract; upstream tutorial prose is not. */
@@ -66,6 +79,12 @@ export async function createWorkflow(options: WorkflowOptions) {
     defineTool({ name: 'card_search_sources', label: 'Search material', description: 'Search the imported material chapters (资料/分章) for a person, event or phrase. Keywords: every word must appear in a line; regex: true for a regular expression. Returns file, material, chapter title, line number and snippet. Use it before reading chapters instead of running commands.',
       parameters: Type.Object({ query: Type.String({ minLength: 1, maxLength: 200 }), regex: Type.Optional(Type.Boolean()), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })), source: Type.Optional(Type.String()) }),
       execute: async (_id, args, signal) => textResult(await options.card!.searchSources(args as Record<string, unknown>, signal)) }),
+    // One-click making sends dispatches in the order they were registered, so two calls in one reply must not run side by side:
+    // `executionMode` is the agent loop's own flag and never reaches the model request (pi-agent-core, executeToolCalls).
+    ...(options.card.addDispatches ? [defineTool({ name: 'card_add_dispatches', label: 'Register dispatches', description: `Planning only, after the design book is written: register dispatches for the sections, 1-${DISPATCH_BATCH_LIMIT} per call, one board per call, in the planned order. target is 板块/分区 such as 世界书/人设 (a board with one section: just its name, such as 开场白); title is new within its section; prerequisite is optional; body is everything the section AI needs. Returns a result for each item: fix and resend only the refused ones.`,
+      parameters: Type.Object({ dispatches: Type.Array(Type.Object({ target: Type.String(), title: Type.String(), prerequisite: Type.Optional(Type.String()), body: Type.String() }), { minItems: 1, maxItems: DISPATCH_BATCH_LIMIT }) }),
+      executionMode: 'sequential',
+      execute: async (_id, args, signal) => textResult(await options.card!.addDispatches!(args as Record<string, unknown>, signal)) })] : []),
   ] : [];
   // The built-in browser, for workbench tasks only (§6.4); every call still goes through tool approval.
   const browserTools: ToolDefinition[] = options.browser ? [
@@ -132,18 +151,47 @@ export async function createWorkflow(options: WorkflowOptions) {
         options.emit({ type: 'workflow_plan', text: result.plan, status: 'pending' }); return completion.planModeCompleted(result.plan);
       } }),
   ];
+  // The app passes the subagents this lead may dispatch, already one line each (stage 3).
+  const roleList = describeRoles(options.roles);
+  // The lead's 成员额度 (Q26), told where it picks members. A squad is still 2 to 6 members per call, within what the quota leaves.
+  const quota = Number.isInteger(options.squadSize) && options.squadSize >= 1 && options.squadSize <= 6 ? options.squadSize : 6;
+  const memberQuota = `Your member quota is ${quota}: you may hold at most ${quota === 1 ? '1 member' : `${quota} members`} at once (working or queued); a member that has returned frees its place.`;
+  const teamQuota = quota === 1
+    ? 'Your member quota is 1: you may hold only one member at a time, so a squad of 2 or more is refused. Use dispatch_member to send one member at a time.'
+    : `Your member quota is ${quota}: you may hold at most ${quota} members at once (working or queued, counting those you dispatched earlier), so a squad that does not fit is refused; a member that has returned frees its place.`;
+  // Card members work in the lead's card folder with what files and create give a 写组件 (spec §6.3); the workbench has worktrees.
+  const whereMember = options.card
+    ? 'Members work in this card folder: a 写组件 writes only the files and new components you give it in files and create, never the shared files, so give no two of them the same file.'
+    : 'In a clean Git repository a writing member gets its own worktree; otherwise it writes in this same folder, so give it files no one else is changing.';
+  const whereTeam = options.card
+    ? 'Members work in this card folder: give each 写组件 its own files and new components in files and create.'
+    : 'Without a clean Git repository writing members share this folder, so assign each member separate files.';
+  const filesField = Type.Optional(Type.Array(Type.String({ minLength: 1 }), { maxItems: 20, description: options.card ? 'For a 写组件 only: existing component files it may change, as paths relative to the card folder, such as 世界书/人设/120-红孩儿.md.' : 'For card studio members only; leave it out here.' }));
+  const createField = Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 60 }), { maxItems: 20, description: options.card ? 'For a 写组件 only: names of the new components it may make with card_new_component.' : 'For card studio members only; leave it out here.' }));
   if (options.canDelegate) tools.push(
-    defineTool({ name: 'agent', label: 'Subagent', description: 'Delegate one independent task with a Chinese name and clear deliverable. Roles: general-purpose, Explore (read-only), Plan. In a clean Git repository a writing member gets its own worktree; otherwise it writes in this same folder, so give it files no one else is changing. Collect its result before completing.', parameters: Type.Object({ subagent_type: Type.Optional(Type.String()), name: Type.Optional(Type.String({ minLength: 1, maxLength: 24 })), prompt: Type.String({ minLength: 1 }), description: Type.Optional(Type.String()), run_in_background: Type.Optional(Type.Boolean()) }), execute: async (_id, args, signal) => textResult(await options.delegate({ role: args.subagent_type || 'general-purpose', prompt: args.prompt, title: args.description, name: args.name }, signal)) }),
-    defineTool({ name: 'agent_team', label: 'Subagent team', description: 'Delegate independent parts of substantial work to a temporary squad (up to 6). Give each member a distinct Chinese name and clear deliverable; collect results and integrate them. Without a clean Git repository writing members share this folder, so assign each member separate files. Use fewer members when the work is smaller.', parameters: Type.Object({ members: Type.Array(Type.Object({ name: Type.String({ minLength: 1, maxLength: 24 }), prompt: Type.String({ minLength: 1 }), role: Type.Optional(Type.String()) }), { minItems: 2, maxItems: 6 }) }), execute: async (_id, args, signal) => textResult(await options.team(args, signal)) }),
-    defineTool({ name: 'get_subagent_result', label: 'Subagent results', description: 'Inspect child tasks or wait for selected children. IDs come from agent or agent_team. Omit agent_id to inspect or wait for all members of this task.', parameters: Type.Object({ agent_id: Type.Optional(Type.String()), wait: Type.Optional(Type.Boolean()) }), execute: async (_id, args, signal) => textResult(await (args.wait ? options.wait : options.agents)({ ...(args.agent_id ? { taskIds: [args.agent_id] } : {}) }, signal)) }),
-    defineTool({ name: 'steer_subagent', label: 'Steer subagent', description: 'Send a follow-up instruction to one of this task’s child agents.', parameters: Type.Object({ agent_id: Type.String(), message: Type.String() }), execute: async (_id, args, signal) => textResult(await options.steer(args, signal)) }),
+    defineTool({ name: 'dispatch_member', label: 'Dispatch member', description: `Dispatch one squad member for one independent task, with a Chinese name and a clear deliverable. ${whereMember} ${memberQuota} Collect its result with member_result before completing. role is one of:\n${roleList}`,
+      parameters: Type.Object({ role: Type.String({ minLength: 1 }), task: Type.String({ minLength: 1 }), name: Type.Optional(Type.String({ minLength: 1, maxLength: 24 })), title: Type.Optional(Type.String()), files: filesField, create: createField }),
+      execute: async (_id, args, signal) => textResult(await options.delegate({ role: args.role, prompt: args.task, title: args.title, name: args.name, files: args.files, create: args.create }, signal)) }),
+    defineTool({ name: 'dispatch_team', label: 'Dispatch team', description: `Dispatch independent parts of substantial work to a temporary squad of 2 to 6 members per call. ${teamQuota} Give each member a distinct Chinese name and a clear deliverable; collect the results and integrate them. ${whereTeam} Use fewer members when the work is smaller. A member's role is one of:\n${roleList}`,
+      parameters: Type.Object({ members: Type.Array(Type.Object({ name: Type.String({ minLength: 1, maxLength: 24 }), task: Type.String({ minLength: 1 }), role: Type.Optional(Type.String()), files: filesField, create: createField }), { minItems: 2, maxItems: 6 }) }),
+      execute: async (_id, args, signal) => textResult(await options.team({ members: args.members.map(member => ({ name: member.name, prompt: member.task, ...(member.role ? { role: member.role } : {}), ...(member.files ? { files: member.files } : {}), ...(member.create ? { create: member.create } : {}) })) }, signal)) }),
+    defineTool({ name: 'member_result', label: 'Member results', description: 'Inspect squad members or wait for them. IDs come from dispatch_member or dispatch_team. Omit member_id to inspect or wait for every member of this task.',
+      parameters: Type.Object({ member_id: Type.Optional(Type.String()), wait: Type.Optional(Type.Boolean()) }),
+      execute: async (_id, args, signal) => textResult(await (args.wait ? options.wait : options.agents)({ ...(args.member_id ? { taskIds: [args.member_id] } : {}) }, signal)) }),
+    defineTool({ name: 'message_member', label: 'Message member', description: 'Send a follow-up instruction to one of this task’s squad members.',
+      parameters: Type.Object({ member_id: Type.String(), message: Type.String() }),
+      execute: async (_id, args, signal) => textResult(await options.steer({ agent_id: args.member_id, message: args.message }, signal)) }),
   );
   return {
     tools, publishTodos,
     restore(ctx: ExtensionContext) { state = replay.replayFromBranch(ctx); publishTodos(); },
-    rolePrompt(role?: AgentRole): string { return role?.builtIn ? role.id === 'Explore' ? 'Role: Explore. Inspect the project and return findings; do not change files.' : role.id === 'Plan' ? 'Role: Plan. Inspect, clarify material decisions, and return an actionable plan.' : '' : role?.prompt || ''; },
+    rolePrompt(role?: AgentRole): string {
+      if (!role?.builtIn) return role?.prompt || '';
+      const id = canonicalRoleId(role.id);
+      return id === 'explorer' ? 'Role: explorer. Inspect the project and return findings; do not change files.' : id === 'planner' ? 'Role: planner. Inspect, clarify material decisions, and return an actionable plan.' : '';
+    },
     allowsInPlan(name: string, args: Record<string, unknown>): boolean {
-      if (['read', 'ls', 'web_search', 'fetch_content', 'search_skills', 'use_skill', 'todo', 'ask_user_question', 'plan_mode_question', 'plan_mode_complete', 'ctx_search', 'ctx_memory', 'agent', 'agent_team', 'get_subagent_result', 'steer_subagent', 'card_check', 'card_search_sources', 'mark_chapter', ...BROWSER_READS].includes(name)) return true;
+      if (['read', 'ls', 'web_search', 'fetch_content', 'search_skills', 'use_skill', 'todo', 'ask_user_question', 'plan_mode_question', 'plan_mode_complete', 'ctx_search', 'ctx_memory', ...MEMBER_TOOLS, 'card_check', 'card_search_sources', 'mark_chapter', ...BROWSER_READS].includes(name)) return true;
       return name === 'powershell' && policy.findBlockedPowerShellCommandSegment(String(args.command || ''), {}, options.cwd) === undefined;
     },
   };

@@ -4,12 +4,13 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { initPrompt } from '../shared/init-prompt.ts';
+import { identityLanguage } from '../shared/identity.ts';
 import { chapterTitle } from '../shared/chapters.ts';
 import { discoverAgents } from '../core/agents.ts';
 import { countHooks, hooksFor, parseHooks, type HookEvent, type HooksConfig } from '../core/hooks-config.ts';
 import { runHooks, type HookInput, type HookOutcome } from './hooks.ts';
 import type { BrowserBridge } from './browser-bridge.ts';
-import { mergeAgents, usableAgents, type DiscoveredAgent } from '../shared/agents.ts';
+import { answersAsPlanner, canonicalRoleId, CUSTOM_ROLE_ID, dispatchName, findRole, isReservedRoleId, mergeAgents, readsOnly, roleLabel, roleSummaries, roleUnavailable, savedCustomRoles, usableAgents, type DiscoveredAgent } from '../shared/agents.ts';
 import { dirname, join, resolve } from 'node:path';
 import { realpath, rm, stat } from 'node:fs/promises';
 import { AppStore } from '../core/store.ts';
@@ -22,6 +23,7 @@ import { discoverSkills, skillsForProject } from '../core/skills.ts';
 import { defaultEffortMap, effectiveEffort, validateGatewayEffort } from '../shared/effort.ts';
 import { gatewayModels, normalizeGatewayModels, resolveGatewayModel } from '../shared/gateway-models.ts';
 import { isGatewayUpstream } from '../shared/gateway-upstream.ts';
+import { keepLocalTraffic, trafficSettings, validRateLimit, validRetry, validStall } from '../shared/gateway-traffic.ts';
 import { mergeUsageLedger, summarizeTaskUsage } from '../shared/usage.ts';
 import { buildTranscript, transcriptFileName } from '../shared/transcript.ts';
 import { JailbreakStore } from './jailbreak-store.ts';
@@ -35,12 +37,14 @@ import type { CardStudioService } from './card-studio.ts';
 import { sectionLabel } from '../shared/card-studio/boards.ts';
 import { BUILT_IN_THEMES, THEME_ID } from '../shared/themes.ts';
 import { PET_ID } from '../shared/pets.ts';
+import { APP_VERSION } from '../shared/version.ts';
 import { budgetUsage, exceededBudget } from '../core/task-budget.ts';
 import { getEcosystemSkillPaths } from '../runtime/ecosystem-skills.ts';
-import { defaultEcosystem, extensionManifest } from '../core/ecosystem.ts';
+import { DREAMER_ROLE, defaultEcosystem, extensionManifest } from '../core/ecosystem.ts';
 import { ConfigBackup, type BackupData } from './ecosystem-backup.ts';
 import type { Vault } from './vault.ts';
-import type { CardHandoffState, CardRun, CardSettings, CardSettingsChange } from '../shared/card-studio/types.ts';
+import type { CardHandoffState, CardMemberRole, CardRun, CardSettings, CardSettingsChange, CardSquadAssignment, CardSquadMode } from '../shared/card-studio/types.ts';
+import { CARD_ROLES, CARD_SQUAD_MODES, FILES_ONLY_FOR_WRITERS, cardDispatchRoles, cardMemberKind, cardSquadSettings, checkAssignment, claimAssignment, squadClaims, type SquadClaims } from '../shared/card-studio/squad.ts';
 import type { AppSnapshot, AgentRole, Approval, BrowserState, EcosystemConfig, FromWorker, Gateway, GatewaySelfTest, Interaction, McpServerConfig, MemoryItem, NewSchedule, NewTask, PermissionMode, Preferences, Project, Schedule, SearchConfig, SearchOutput, SkillInfo, Task, ThinkingLevel, ToWorker } from '../shared/types.ts';
 
 const terminal = new Set(['idle', 'completed', 'failed', 'cancelled']);
@@ -50,6 +54,7 @@ const stamp = () => new Date().toISOString();
 const CARD_BUSY = '这张卡有另一个对话正在运行。同一张卡同一时间只运行一个对话，请等它结束或先停止它。';
 function object(value: unknown): Record<string, unknown> { return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}; }
 function string(value: unknown): string { return typeof value === 'string' ? value : ''; }
+function strings(value: unknown): string[] { return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []; }
 /** A message still queued when its task stops never goes out; left pending, every later message would be placed above it. */
 function unqueue(task: Task): void { for (const message of task.messages) if (message.pending) message.pending = false; }
 function contentText(value: unknown, type = 'text'): string {
@@ -58,6 +63,8 @@ function contentText(value: unknown, type = 'text'): string {
 }
 interface Running { child: ChildProcess; ready: boolean; cancelling: boolean; started: boolean; killTimer?: ReturnType<typeof setTimeout> }
 interface Waiting { parentId: string; requestId: string; taskIds: string[] }
+/** The subagent a member runs as and whether it may write, decided once when its lead sends it. */
+interface MemberAccess { roleId: string; readOnly: boolean }
 
 export class Harness extends EventEmitter {
   readonly store: AppStore;
@@ -70,12 +77,18 @@ export class Harness extends EventEmitter {
   readonly jailbreak: JailbreakStore;
   /** 每分钟请求上限 and 网关冷却, shared by every worker of a gateway. */
   readonly rateLimiter = new RateLimiter();
+  /** Rate-slot waits by task. Stopping the task gives them up, so a request that never went out never takes a slot. */
+  private slotWaits = new Map<string, Set<AbortController>>();
   private cardStudio?: CardStudioService;
   private starting = new Set<string>();
   private budgetBaselines = new Map<string, ReturnType<typeof budgetUsage>>();
   private budgetStarts = new Map<string, number>(); private budgetStopping = new Set<string>();
   private retiring = new Map<string, { child: ChildProcess; finished: Promise<void> }>();
   private admissions = new Map<string, number>();
+  /** What card members being started right now were given, by lead (spec §6.3); their tasks hold it once they exist. */
+  private claiming = new Map<string, CardSquadAssignment[]>();
+  /** The names of card members being started right now, by lead, so two never get the same 资料员N or 写手N. */
+  private naming = new Map<string, Set<string>>();
   private prompts = new Map<string, Extract<ToWorker, { type: 'prompt' }>>();
   private approvals = new Map<string, Approval>();
   private interactions = new Map<string, Interaction>();
@@ -128,7 +141,7 @@ export class Harness extends EventEmitter {
   }
   publicView(): AppSnapshot {
     const ecosystem = { ...this.store.state.ecosystem, roles: this.roles(), mcpServers: this.store.state.ecosystem.mcpServers.map(s => ({ ...s, hasSecrets: this.vault.has(`mcp:${s.id}`) })), webdav: { ...this.store.state.ecosystem.webdav, hasPassword: this.vault.has('webdav:password') } };
-    return { ...this.store.state, storageError: this.store.lastSaveError?.message, tasks: this.store.state.tasks.map(task => ({ ...task, workerActive: this.workers.has(task.id) || this.retiring.has(task.id) || this.starting.has(task.id) })), studio: this.studio?.snapshot(), cardStudio: this.cardStudio?.snapshot(), ecosystem, extensions: extensionManifest(ecosystem, this.store.state.search), interactions: [...this.interactions.values()], search: { ...this.store.state.search, hasKey: this.vault.has('search:brave') }, gateways: this.store.state.gateways.map(g => ({ ...g, hasKey: this.vault.has(g.id) })), approvals: [...this.approvals.values()], skills: this.skills, browser: this.browserState, rateLimits: this.rateLimitView(), version: '1.2.0' };
+    return { ...this.store.state, storageError: this.store.lastSaveError?.message, tasks: this.store.state.tasks.map(task => ({ ...task, workerActive: this.workers.has(task.id) || this.retiring.has(task.id) || this.starting.has(task.id) })), studio: this.studio?.snapshot(), cardStudio: this.cardStudio?.snapshot(), ecosystem, extensions: extensionManifest(ecosystem, this.store.state.search), interactions: [...this.interactions.values()], search: { ...this.store.state.search, hasKey: this.vault.has('search:brave') }, gateways: this.store.state.gateways.map(g => ({ ...g, hasKey: this.vault.has(g.id) })), approvals: [...this.approvals.values()], skills: this.skills, browser: this.browserState, rateLimits: this.rateLimitView(), version: APP_VERSION };
   }
   snapshot(): AppSnapshot { return structuredClone(this.publicView()); }
   attachStudio(studio: StudioServices): void { this.studio = studio; }
@@ -386,20 +399,34 @@ export class Harness extends EventEmitter {
     task.card.web = enabled;
     // Tools are fixed when a worker starts; a running conversation gets the new search state for its next run.
     if (this.workers.has(id)) this.send(id, { type: 'search', search: { ...this.store.state.search, enabled, hasKey: this.vault.has('search:brave'), apiKey: this.vault.get('search:brave') } });
+    // The members of this conversation search as it does (spec §6.2); a running one gets the new state at once.
+    for (const member of this.store.state.tasks.filter(item => item.parentId === id && item.card?.member)) {
+      member.card!.web = enabled;
+      if (this.workers.has(member.id)) this.send(member.id, { type: 'search', search: { ...this.store.state.search, enabled, hasKey: this.vault.has('search:brave'), apiKey: this.vault.get('search:brave') } });
+    }
     this.changed();
   }
-  async createTask(input: NewTask): Promise<Task> {
+  /** `definition` is a role the app carries itself (the Dreamer's): it needs no subagent from the list, so no switch, file or replacement touches it. Only code in this process can pass one. */
+  async createTask(input: NewTask, definition?: AgentRole): Promise<Task> {
     const parentEpoch = input.parentId ? this.cancellationEpochs.get(input.parentId) || 0 : 0;
     const parentWasActive = input.parentId ? !terminal.has(this.task(input.parentId).status) : false;
     const project = this.store.state.projects.find(p => p.id === input.projectId);
     if (!project) throw new Error('Select a project folder first.');
     if ((project.kind === 'card') !== Boolean(input.card)) throw new Error(project.kind === 'card' ? '卡项目的对话请在制卡工坊里开始。' : 'Card conversations belong to card projects.');
-    // Card conversations do not start squads, except the read-only reading squad of an Ultra planning conversation.
+    // A card conversation starts only the members its settings allow (spec §6.1); a member never starts one.
     if (input.card && input.parentId) {
       const lead = this.task(input.parentId);
-      if (!input.card.member || lead.card?.sectionId !== 'plan' || lead.thinking !== 'ultra') throw new Error('Card conversations do not start squads.');
+      const role = input.card.squad?.role;
+      if (!input.card.member || !role || !lead.card || lead.parentId || !this.cardRolesFor(lead).includes(role)) throw new Error('这个对话现在不能派这种小队成员。');
     }
     const parent = input.parentId ? this.task(input.parentId) : undefined;
+    if (input.role && typeof input.role !== 'string') throw new Error('Select an available agent role.');
+    // The subagent this task runs as (§5.1): one usable in this project, named by its id, its file's name or its 1.2 id.
+    // Card conversations run a section, not a subagent.
+    const roles = input.card ? [] : this.roles(project.id);
+    const requestedRole = input.role || 'executor';
+    const role = input.card ? undefined : definition ?? findRole(usableAgents(roles, project.id), requestedRole);
+    if (!input.card && !role) throw new Error(roleUnavailable(roles, canonicalRoleId(requestedRole), project.id) ?? `没有可用的子代理「${requestedRole}」。`);
     const gatewayId = input.gatewayId || parent?.gatewayId || this.store.state.preferences.defaultGatewayId;
     if (input.prompt?.trim()) this.gateway(gatewayId);
     const permission = input.permission || this.store.state.preferences.defaultPermission;
@@ -420,16 +447,19 @@ export class Harness extends EventEmitter {
       id: randomUUID(), projectId: project.id, title: (input.title || input.prompt?.trim().slice(0, 70) || 'New task').slice(0, 160),
       cwd: project.path, parentId: input.parentId, status: 'idle', permission,
       gatewayId, modelId: configured?.modelId, contextWindow: configured?.contextWindow, thinking, createdAt: stamp(), updatedAt: stamp(), messages: [], tools: [], scheduleId: input.scheduleId,
-      role: input.role || 'general-purpose', planMode: input.planMode ?? input.role === 'Plan', todos: [], runtimeStatus: {},
+      // Plan mode by default for the planner and for a subagent standing in for it (a file named planner or Plan), whose id is not `planner`.
+      role: role?.id ?? canonicalRoleId(requestedRole), planMode: input.planMode ?? (!!role && answersAsPlanner(role)), todos: [], runtimeStatus: {},
       agentName: input.agentName, squadId: input.squadId, sharedReadOnly: Boolean(input.parentId && input.sharedReadOnly), ...(input.parentId && input.sharedWorkspace && !input.sharedReadOnly ? { sharedWorkspace: true } : {}), assignedTask: input.parentId ? input.prompt?.slice(0, 4000) : undefined,
+      // Read-only by design (stage 3), decided here once whatever definition the role resolves to: a member its lead sent read-only
+      // or seated read-only in the lead's folder, a task whose subagent only reads, the Dreamer (input.readOnly).
+      ...(input.readOnly || (input.parentId && input.sharedReadOnly) || (role && readsOnly(role)) ? { readOnly: true } : {}),
       ...(input.card ? { card: structuredClone(input.card) } : {}),
       // A card's conversations follow the card's own choice, so only workbench tasks carry one.
       ...(input.jailbreak && !input.card && this.jailbreak.read(input.jailbreak.pack) ? { jailbreak: { pack: input.jailbreak.pack } } : {}),
     };
-    if (task.sharedReadOnly) { task.cwd = this.task(task.parentId!).cwd; task.role = 'Explore'; }
+    if (task.sharedReadOnly) task.cwd = this.task(task.parentId!).cwd;
     if (task.sharedWorkspace) task.cwd = this.task(task.parentId!).cwd;
     await this.waitForDirectoryRelease(task.cwd);
-    if (!this.store.state.ecosystem.roles.some(role => role.id === task.role)) throw new Error('Select an available agent role.');
     const isolated = !task.sharedReadOnly && !task.sharedWorkspace && !task.card && (input.isolated ?? project.isGit);
     if (isolated) {
       task.worktree = await createWorktree(project, task.id, join(this.dataDir, 'worktrees'));
@@ -446,11 +476,17 @@ export class Harness extends EventEmitter {
     if (task.status !== 'cancelled' && (input.prompt?.trim() || input.attachments?.length)) await this.prompt(task.id, input.prompt || 'Use the attached material.', undefined, input.attachments);
     return structuredClone(task);
   }
+  /**
+   * A squad member working in its lead's folder. While the folder is locked — another member's checkpoint, say — it waits
+   * in the queue instead of being refused: pump() starts it once the lock is gone, and beforeRun() serialises the
+   * checkpoints. A user's own message in a locked folder is still refused, as before.
+   */
+  private sharesLeadFolder(task: Task): boolean { return !!(task.parentId && (task.sharedWorkspace || task.sharedReadOnly)); }
   async prompt(id: string, text: string, behavior?: 'steer' | 'followUp', attachmentIds?: string[]): Promise<void> {
     await this.retiring.get(id)?.finished;
     const task = this.task(id);
     await this.waitForDirectoryRelease(task.cwd);
-    if (this.studio?.directoryLocked(task.cwd)) throw new Error('Wait for checks or the reviewed file operation in this folder before sending a message.');
+    if (!this.sharesLeadFolder(task) && this.studio?.directoryLocked(task.cwd)) throw new Error('Wait for checks or the reviewed file operation in this folder before sending a message.');
     if (!text.trim() && attachmentIds?.length) text = 'Use the attached material.';
     if (!text.trim()) throw new Error('Enter a task or message.');
     if (text.length > 200_000) throw new Error('Message is too long (maximum 200,000 characters).');
@@ -466,18 +502,24 @@ export class Harness extends EventEmitter {
     const active = this.workers.get(id);
     if (active?.cancelling) throw new Error('Wait for cancellation to finish.');
     if (active && !behavior) throw new Error('Choose Steer or Follow up while the agent is running.');
+    // A new run needs its subagent; steering one that is already running does not start anything.
+    if (!active && !task.card) this.runRole(task);
     if (!active && this.directoryBusy(task)) {
       throw new Error(task.card ? CARD_BUSY : 'This working directory is already in use by another task.');
     }
     const attachments = this.studio ? await this.studio.inputs(attachmentIds) : [];
-    if (this.studio?.directoryLocked(task.cwd)) throw new Error('Wait for checks or the reviewed file operation in this folder before sending a message.');
+    if (!this.sharesLeadFolder(task) && this.studio?.directoryLocked(task.cwd)) throw new Error('Wait for checks or the reviewed file operation in this folder before sending a message.');
     const startedDispatch = task.card && this.cardStudio ? await this.cardStudio.beforePrompt(task, text.trim()) : undefined;
     if (!active && !task.parentId) { this.budgetBaselines.set(task.id, budgetUsage(this.store.state.tasks.filter(item => item.id === task.id || item.parentId === task.id))); this.budgetStarts.set(task.id, Date.now()); this.budgetStopping.delete(task.id); }
     const submit = await this.hooks('UserPromptSubmit', task, { prompt: text.trim(), quiet: true });
     if (submit.decision === 'deny') { task.messages.push({ id: randomUUID(), role: 'system', text: `[UserPromptSubmit] ${(submit.reason || '钩子拦下了这条消息。').slice(0, 2_000)}`, at: stamp() }); this.changed(); throw new Error(submit.reason || '钩子拦下了这条消息。'); }
     if (submit.messages.length) text = [text.trim(), ...submit.messages.map(note => `[UserPromptSubmit] ${note}`)].join('\n\n');
     const messageId = randomUUID();
-    task.messages.push({ id: messageId, turnId: messageId, role: 'user', text: text.trim(), at: stamp(), pending: true, ...(attachments.length ? { attachments: attachments.map(({ storedPath: _path, ...info }) => info) } : {}), ...(startedDispatch ? { dispatchId: startedDispatch } : {}) });
+    // A card member's message belongs to the lead turn that sent it (spec §6.6): the work it starts counts there, and stays there
+    // when a later turn is withdrawn or edited.
+    const lead = task.card?.member && task.parentId ? this.store.state.tasks.find(item => item.id === task.parentId) : undefined;
+    const leadTurnId = lead ? this.currentTurn(lead) : undefined;
+    task.messages.push({ id: messageId, turnId: messageId, role: 'user', text: text.trim(), at: stamp(), pending: true, ...(attachments.length ? { attachments: attachments.map(({ storedPath: _path, ...info }) => info) } : {}), ...(startedDispatch ? { dispatchId: startedDispatch } : {}), ...(leadTurnId ? { leadTurnId } : {}) });
     task.updatedAt = stamp();
     task.error = undefined;
     task.truncation = undefined;
@@ -503,9 +545,32 @@ export class Harness extends EventEmitter {
       void this.start(task);
     }
   }
+  /**
+   * The subagent a workbench task runs as, looked up again before every run. One that is gone, switched off or replaced by
+   * another of the same name refuses to start, instead of running writable without its instructions (stage 3). This replaces
+   * stage 2's fallback to the saved built-in: a task never runs as anything but the subagent it was made with.
+   */
+  private runRole(task: Task): AgentRole { return this.roleToRun(task.projectId, task.role || 'executor'); }
+  private roleToRun(projectId: string, roleId: string): AgentRole {
+    // The Dreamer carries its own definition, outside the list the user manages.
+    if (roleId === DREAMER_ROLE.id) return DREAMER_ROLE;
+    const roles = this.roles(projectId);
+    const id = canonicalRoleId(roleId);
+    const role = usableAgents(roles, projectId).find(item => item.id === id);
+    if (role) return role;
+    // Only the exact id counts: a file of the same name is another subagent, and the refusal always says why.
+    throw new Error(`${roleUnavailable(roles, id, projectId, { exact: true }) ?? `子代理「${roleLabel(id)}」不可用。`}这一轮没有开始。在「设置 › 工作区能力 › 子代理」里查看。`);
+  }
+  /** Whether the subagent a task was made with only reads (readsOnly). A task saved before 1.3 carries no read-only flag, so its subagent says. */
+  private roleReadsOnly(task: Task): boolean {
+    const id = canonicalRoleId(task.role || 'executor');
+    const role = this.roles(task.projectId).find(item => item.id === id);
+    return !!role && readsOnly(role);
+  }
   private async start(task: Task): Promise<void> {
     this.starting.add(task.id);
     try {
+      const roleDefinition = task.card ? undefined : this.runRole(task);
       await this.hooks('SessionStart', task);
       if (this.studio) await this.studio.beforeRun(task, this.prompts.get(task.id)?.messageId || randomUUID());
       if (this.closing || task.status === 'cancelled') return;
@@ -516,8 +581,11 @@ export class Harness extends EventEmitter {
       this.refreshSkills();
       const apiKey = this.vault.get(gateway.id);
       if (!existsSync(task.cwd)) throw new Error('Project directory no longer exists.');
-      // Card conversations: section prompt, read-only built-in resources, no squads, no memory, web only when turned on.
+      // Card conversations: the section prompt (a member's own), read-only built-in resources, members only as the 子代理 switch allows, no memory, web only when turned on.
       const card = task.card && this.cardStudio ? await this.cardStudio.workerContext(task) : undefined;
+      // Stopped while its card prompt was read (a member whose lead's run just ended): it never starts, rather than running
+      // without its prompt. The await may have changed the status checked before it.
+      if (this.closing || (task.status as Task['status']) === 'cancelled') return;
       const env: NodeJS.ProcessEnv = {};
       for (const key of ['PATH', 'Path', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'USERPROFILE', 'HOME', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMFILES', 'ProgramFiles', 'ProgramFiles(x86)', 'PSModulePath', 'LANG']) {
         if (process.env[key]) env[key] = process.env[key];
@@ -559,7 +627,11 @@ export class Harness extends EventEmitter {
         user: this.store.state.preferences.name?.trim() || '用户',
         char: task.card ? project?.name ?? '' : '',
       });
-      this.send(task.id, { type: 'init', ...(jailbreak ? { jailbreak } : {}), squadSize: this.studio?.state.preferences.defaultSquadSize || 6, fileCheckpoints: !!this.studio, sandbox: this.studio ? { enabled: this.studio.state.preferences.sandboxEnabled, helperPath: this.studio.helperPath } : undefined, attachmentRoot: this.studio?.attachments.root, networkOrigins: this.networkOrigins(gateway), taskId: task.id, cwd: task.cwd, agentDir: join(this.dataDir, 'agents', task.id), sessionDir: join(this.dataDir, 'sessions', task.id), sessionFile: task.sessionFile, sessionLeafId: task.sessionLeafId, branchBeforeEntryId: task.branchBeforeEntryId, skillFiles: skillsForProject(this.skills, task.projectId), gateway, apiKey, thinking: task.thinking, permission: task.permission, instructions: this.store.state.preferences.instructions, skillPaths: this.store.state.preferences.skillPaths, canDelegate: !task.parentId && (!task.card || (task.card.sectionId === 'plan' && task.thinking === 'ultra')), search: { ...this.store.state.search, ...(task.card ? { enabled: !!task.card.web } : {}), hasKey: this.vault.has('search:brave'), apiKey: this.vault.get('search:brave') }, dataDir: this.dataDir, projectId: task.projectId, ecosystem: task.card ? { ...this.store.state.ecosystem, memoryEnabled: false } : this.store.state.ecosystem, mcpServers: this.store.state.ecosystem.mcpServers.map(server => ({ ...server, ...this.mcpSecrets(server.id) })), role: task.role, sharedWorkspace: !!task.sharedWorkspace, hooks: this.toolHooks(), browser: !task.card && !!this.browser, roleDefinition: task.card ? { id: 'card-section', name: sectionLabel(task.card.sectionId), prompt: '', readOnly: !!task.card.member } : task.sharedReadOnly ? { id: 'Explore', name: 'Explore', prompt: 'Read-only squad researcher. Do not modify files.', readOnly: true, builtIn: true } : usableAgents(this.roles(task.projectId), task.projectId).find(role => role.id === task.role), planMode: task.card ? false : task.planMode, todos: task.todos, ...(card ? { card } : {}) });
+      // 小绘 (ADR 0022): the interface language, the personality switch, and whether this run is a squad member. A member is one a lead
+      // dispatched: only delegateMember gives a task its own name (agentName, which also signs its replies). A child the user starts by
+      // hand has no name and talks to the user as 小绘 herself.
+      const identity = { language: identityLanguage(this.store.state.preferences.language), persona: this.store.state.preferences.persona !== false, member: !!task.agentName };
+      this.send(task.id, { type: 'init', rateSlots: true, identity, ...(jailbreak ? { jailbreak } : {}), squadSize: this.squadLimit(), fileCheckpoints: !!this.studio && !task.card?.member, sandbox: this.studio ? { enabled: this.studio.state.preferences.sandboxEnabled, helperPath: this.studio.helperPath } : undefined, attachmentRoot: this.studio?.attachments.root, networkOrigins: this.networkOrigins(gateway), taskId: task.id, cwd: task.cwd, agentDir: join(this.dataDir, 'agents', task.id), sessionDir: join(this.dataDir, 'sessions', task.id), sessionFile: task.sessionFile, sessionLeafId: task.sessionLeafId, branchBeforeEntryId: task.branchBeforeEntryId, skillFiles: skillsForProject(this.skills, task.projectId), gateway, apiKey, thinking: task.thinking, permission: task.permission, instructions: this.store.state.preferences.instructions, skillPaths: this.store.state.preferences.skillPaths, canDelegate: !task.parentId && (!task.card || !!card?.dispatchRoles?.length), roles: task.card ? card?.dispatchRoles : roleSummaries(usableAgents(this.roles(task.projectId), task.projectId)), search: { ...this.store.state.search, ...(task.card ? { enabled: !!task.card.web } : {}), hasKey: this.vault.has('search:brave'), apiKey: this.vault.get('search:brave') }, dataDir: this.dataDir, projectId: task.projectId, ecosystem: task.card ? { ...this.store.state.ecosystem, memoryEnabled: false } : this.store.state.ecosystem, mcpServers: task.card?.member ? [] : this.store.state.ecosystem.mcpServers.map(server => ({ ...server, ...this.mcpSecrets(server.id) })), role: task.role, sharedWorkspace: !!task.sharedWorkspace, hooks: this.toolHooks(), browser: !task.card && !!this.browser, readOnly: !!(task.readOnly || task.sharedReadOnly), roleDefinition: task.card ? { id: 'card-section', name: sectionLabel(task.card.sectionId), prompt: '', readOnly: !!task.readOnly } : roleDefinition, planMode: task.card ? false : task.planMode, todos: task.todos, ...(card ? { card } : {}) });
       const timeout = setTimeout(() => {
         if (!running.ready && this.workers.get(task.id) === running) { this.fail(task.id, 'Agent initialization timed out.'); child.kill(); }
       }, 45_000);
@@ -606,15 +678,16 @@ export class Harness extends EventEmitter {
       task.status = running.cancelling ? 'cancelled' : task.error ? 'failed' : 'completed';
       task.updatedAt = stamp(); task.completedAt = task.updatedAt;
       task.contextCompacting = false;
-      if (this.studio) { try { await this.studio.afterRun(task); } catch (error) { if (task.delivery) { task.delivery.verification = 'failed'; task.delivery.error = error instanceof Error ? error.message : String(error); } } }
+      // A card lead's turn is sealed by retire() once its squad has stopped too (spec §6.6), and the card's books follow the
+      // seal there; stopChildren below stops what is left of the squad.
+      if (this.studio && !this.leadsCardSquad(task)) { try { await this.studio.afterRun(task); } catch (error) { if (task.delivery) { task.delivery.verification = 'failed'; task.delivery.error = error instanceof Error ? error.message : String(error); } } }
       this.stopChildren(id);
       this.streaming.delete(id);
       this.cleanupRequests(id);
       this.changed();
       this.emit('finished', structuredClone(task));
       void this.hooks(task.parentId ? 'SubagentStop' : 'Stop', task);
-      if (task.card) void this.cardStudio?.afterConversation(task);
-      this.retire(id, true);
+      this.retire(id, true, () => this.cardBooks(task));
       this.checkWaiters();
       this.pump();
     } else if (message.type === 'request') {
@@ -654,6 +727,13 @@ export class Harness extends EventEmitter {
     if (type === 'workflow_status') task.runtimeStatus = { ...task.runtimeStatus, [string(event.key)]: string(event.value).replace(/\x1b\[[0-9;]*m/g, '') };
     if (type === 'workflow_notice') task.messages.push({ id: randomUUID(), role: 'system', text: string(event.message).replace(/\x1b\[[0-9;]*m/g, ''), at: stamp() });
     if (type === 'workflow_compaction') task.compactions = (task.compactions || 0) + 1;
+    // 网络状态 (§5.5) — 重试: pi announces an automatic retry and waits out its backoff before sending again; a
+    // compaction summary retries the same way. The retried request clears it when it goes out.
+    if ((type === 'auto_retry_start' || type === 'summarization_retry_scheduled') && !this.cooling(task)) {
+      const attempt = Number(event.attempt); const max = Number(event.maxAttempts);
+      task.net = { state: 'retrying', until: Date.now() + Math.max(0, Number(event.delayMs) || 0), ...(attempt > 0 ? { attempt } : {}), ...(max > 0 ? { max } : {}) };
+    }
+    if ((type === 'auto_retry_end' || type === 'summarization_retry_attempt_start' || type === 'summarization_retry_finished') && task.net?.state === 'retrying') delete task.net;
     // 请求诊断: only the shape of the request, never its text; the error card reads it back.
     if (type === 'request_diagnostic') { const diagnostic = object(event.diagnostic); if (diagnostic) task.lastRequest = diagnostic as unknown as Task['lastRequest']; }
     if (type === 'nested_usage') { const usage = object(event.usage); task.messages.push({ id: randomUUID(), role: 'system', text: 'Auxiliary model usage', model: string(event.model), at: stamp(), usage: { input: Number(usage.input) || 0, output: Number(usage.output) || 0, cacheRead: Number(usage.cacheRead) || 0, cacheWrite: Number(usage.cacheWrite) || 0, cost: Number(object(usage.cost).total ?? usage.cost) || 0 } }); }
@@ -676,6 +756,8 @@ export class Harness extends EventEmitter {
       if (msg.thinkingStartedAt && msg.thinkingMs === undefined) msg.thinkingMs = Math.max(0, Date.now() - Date.parse(msg.thinkingStartedAt));
     };
     if (type === 'message_start' && object(event.message).role === 'assistant') {
+      // A reply, or a failed one, has started: the request went out or ended (§5.5).
+      if (!this.cooling(task)) delete task.net;
       this.streaming.delete(task.id); ensureAssistant();
     } else if (type === 'message_update') {
       const update = object(event.assistantMessageEvent);
@@ -727,10 +809,14 @@ export class Harness extends EventEmitter {
     const message = task.messages.findLast(item => item.role === 'user' && !item.pending);
     return message?.turnId ?? message?.id;
   }
+  /** A 429's 冷却 still running: it says more than an attempt count, so a reply or a retry notice leaves it in place. */
+  private cooling(task: Task): boolean { return task.net?.state === 'cooldown' && (task.net.until ?? 0) > Date.now(); }
   private respond(taskId: string, id: string, result?: unknown, error?: string): void { this.send(taskId, { type: 'response', id, result, error }); }
   private async handleRequest(task: Task, request: Extract<FromWorker, { type: 'request' }>): Promise<void> {
     try {
       if (request.method === 'interaction') {
+        // A card squad member never asks the user (spec §6.2): it has no question tools, and this is the backstop.
+        if (task.card?.member) throw new Error('小队成员不能向用户提问：把要问的写进交回结果，由主 AI 处理。');
         const type = String(request.args.type) as Interaction['type'];
         if (!['select', 'confirm', 'input', 'editor', 'questionnaire', 'plan'].includes(type)) throw new Error('Unsupported extension interaction.');
         const interaction = { ...request.args, type, title: string(request.args.title), id: request.id, taskId: task.id } as Interaction;
@@ -742,39 +828,74 @@ export class Harness extends EventEmitter {
         const outcome = await this.hooks(phase === 'pre' ? 'PreToolUse' : 'PostToolUse', task, { toolName: string(request.args.toolName), toolInput: request.args.args });
         this.respond(task.id, request.id, phase === 'pre' ? { decision: outcome.decision, reason: outcome.reason } : { reason: outcome.decision === 'deny' ? outcome.reason : undefined });
       } else if (request.method === 'rate-slot') {
+        // A stopping task sends nothing more; its waits were given up when it began to stop.
+        if (this.workers.get(task.id)?.cancelling) throw new Error('This task is stopping.');
         const gateway = this.store.state.gateways.find(item => item.id === task.gatewayId);
         const limit = gateway?.rateLimit?.enabled ? gateway.rateLimit.perMinute : 0;
-        await this.rateLimiter.acquire(task.gatewayId, limit);
-        this.changed();
+        const controller = new AbortController();
+        const waits = this.slotWaits.get(task.id) ?? new Set<AbortController>();
+        waits.add(controller); this.slotWaits.set(task.id, waits);
+        try {
+          await this.rateLimiter.acquire(task.gatewayId, limit, controller.signal, wait => {
+            // 网络状态 (§5.5): why this request waits, and until when.
+            task.net = { state: wait.reason === 'cooldown' ? 'cooldown' : 'queued', until: wait.until };
+            this.changed(false);
+          });
+        } finally { waits.delete(controller); if (!waits.size && this.slotWaits.get(task.id) === waits) this.slotWaits.delete(task.id); }
+        // The request goes out now (§5.5). Nothing here is saved, so publishing is enough. Another request of this task may
+        // still be waiting for its own slot, and its line stays.
+        if (!this.slotWaits.get(task.id)?.size) delete task.net;
+        this.changed(false);
         this.respond(task.id, request.id, true);
       } else if (request.method === 'rate-cooldown') {
         this.rateLimiter.cooldown(task.gatewayId, Number(request.args.seconds));
-        this.changed();
+        // The task that met the 429 shows 冷却 at once; its retry waits for its slot anyway (§5.5). A task that is stopping
+        // retries nothing, and a worker stopped the hard way never says done to take the line down again.
+        if (!this.workers.get(task.id)?.cancelling) task.net = { state: 'cooldown', until: this.rateLimiter.cooldownUntil(task.gatewayId) };
+        this.changed(false);
         this.respond(task.id, request.id, true);
       } else if (request.method === 'checkpoint') {
         const turnId = string(request.args.turnId); if (!task.messages.some(message => message.id === turnId && message.role === 'user')) throw new Error('Unknown checkpoint turn.');
         await this.studio?.beforeRun(task, turnId); this.respond(task.id, request.id, true);
       } else if (request.method === 'card') {
         if (!this.cardStudio) throw new Error('制卡工坊未启用。');
-        this.respond(task.id, request.id, await this.cardStudio.toolRequest(task, request.args));
+        const result = await this.cardStudio.toolRequest(task, request.args);
+        // A component a 写组件 created is recorded on it (spec §6.3) and saved with it.
+        if (task.card?.member) this.changed(false);
+        this.respond(task.id, request.id, result);
       } else if (request.method === 'browser') {
         this.respond(task.id, request.id, await this.browserRequest(task, request.args));
       } else if (request.method === 'steer_agent') {
         const child = this.task(string(request.args.agent_id)); if (child.parentId !== task.id) throw new Error('Only direct children can be steered.');
-        await this.resumeAgent(child.id, string(request.args.message)); this.respond(task.id, request.id, { id: child.id, status: child.status });
+        // A member that already returned comes back as a new run, so it needs room within 成员额度 like a new one. Its place is
+        // held until it is queued again: the model may message several members at once, and they must not all take the last place.
+        // An agent the user started by hand has no member's name, is never counted, and so needs no place.
+        const returned = !!child.agentName && !this.workers.has(child.id) && terminal.has(child.status);
+        if (returned) { this.assertSquadRoom(task, 1); this.admissions.set(task.id, (this.admissions.get(task.id) || 0) + 1); }
+        try { await this.resumeAgent(child.id, string(request.args.message)); }
+        finally { if (returned) this.admissions.set(task.id, Math.max(0, (this.admissions.get(task.id) || 0) - 1)); }
+        this.respond(task.id, request.id, { id: child.id, status: child.status });
       } else if (request.method === 'team') {
         if (!Array.isArray(request.args.members) || request.args.members.length < 2 || request.args.members.length > 6) throw new Error('A squad needs 2–6 members.');
         const squadId = randomUUID();
-        const members = request.args.members.map(value => { const member = object(value); return { name: this.memberName(string(member.name)), prompt: string(member.prompt), role: string(member.role) || 'general-purpose' }; });
+        const members = request.args.members.map(value => { const member = object(value); return { name: this.memberName(string(member.name)), prompt: string(member.prompt), role: string(member.role) || (task.card ? 'researcher' : 'executor'), files: strings(member.files), create: strings(member.create) }; });
         if (new Set(members.map(member => member.name)).size !== members.length || members.some(member => !member.prompt.trim() || member.prompt.length > 200000)) throw new Error('Give every member a distinct Chinese name and a bounded task.');
+        // §5.2: files and create belong to a card conversation's 写组件.
+        if (!task.card && members.some(member => member.files.length || member.create.length)) throw new Error(FILES_ONLY_FOR_WRITERS);
+        // Every member's subagent and access are settled before anyone starts: one unknown role never leaves half a squad.
+        const access = members.map(member => this.memberAccess(task, member.role, request.args.readOnly === true));
+        // A card squad's files are checked for everyone before anyone starts (spec §6.3).
+        const squads = task.card ? await this.cardSquads(task, members, access) : undefined;
         const started: Task[] = [];
-        this.reserveMembers(task, members.length);
+        try { this.reserveMembers(task, members.length); } catch (error) { this.releaseClaims(task, squads); throw error; }
         try {
-          for (const member of members) started.push(await this.delegateMember(task, { ...member, squadId }));
+          for (const [index, member] of members.entries()) started.push(await this.delegateMember(task, { ...member, squadId }, access[index], squads?.[index]));
           this.respond(task.id, request.id, { squadId, members: started.map(member => this.childSummary(member)) });
         } catch (error) { for (const child of started) if (!terminal.has(child.status)) await this.cancelTask(child.id); throw error; }
-        finally { this.admissions.set(task.id, Math.max(0, (this.admissions.get(task.id) || 0) - members.length)); }
+        finally { this.admissions.set(task.id, Math.max(0, (this.admissions.get(task.id) || 0) - members.length)); this.releaseClaims(task, squads); }
       } else if (request.method === 'approve') {
+        // A card squad member never asks (spec §6.2); its worker refuses first, and this is the backstop.
+        if (task.card?.member) { this.respond(task.id, request.id, false); return; }
         const args = object(request.args.args); const tool = string(request.args.toolName);
         const kind = tool === 'read' ? 'read' : ['write', 'edit'].includes(tool) ? 'write' : 'command';
         const target = kind === 'command' ? string(args.command) : string(args.path);
@@ -786,14 +907,21 @@ export class Harness extends EventEmitter {
         if (last) last.status = 'waiting';
         this.changed(); this.emit('approval', approval);
       } else if (request.method === 'delegate') {
-        this.reserveMembers(task, 1);
+        const input = { name: string(request.args.name) || undefined, title: string(request.args.title), prompt: string(request.args.prompt), role: string(request.args.role) || (task.card ? 'researcher' : 'executor'), files: strings(request.args.files), create: strings(request.args.create) };
+        if (!task.card && (input.files.length || input.create.length)) throw new Error(FILES_ONLY_FOR_WRITERS);
+        const access = this.memberAccess(task, input.role, request.args.readOnly === true);
+        const squad = task.card ? (await this.cardSquads(task, [input], [access]))[0] : undefined;
+        const claimed = squad ? [squad] : undefined;
+        try { this.reserveMembers(task, 1); } catch (error) { this.releaseClaims(task, claimed); throw error; }
         try {
-          const child = await this.delegateMember(task, { name: string(request.args.name) || undefined, title: string(request.args.title), prompt: string(request.args.prompt), role: string(request.args.role) || 'general-purpose' });
+          const child = await this.delegateMember(task, input, access, squad);
           this.respond(task.id, request.id, this.childSummary(child));
-        } finally { this.admissions.set(task.id, Math.max(0, (this.admissions.get(task.id) || 0) - 1)); }
+        } finally { this.admissions.set(task.id, Math.max(0, (this.admissions.get(task.id) || 0) - 1)); this.releaseClaims(task, claimed); }
       } else if (request.method === 'network') {
         const url = new URL(string(request.args.url));
         if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) throw new Error('Invalid network destination.');
+        // A member's network follows the conversation's 联网 switch and never asks (spec §6.2).
+        if (task.card?.member) { this.respond(task.id, request.id, task.card.web === true); return; }
         if (task.permission === 'full' || this.studio?.allows(task, 'network', url.href)) { this.respond(task.id, request.id, true); return; }
         const approval: Approval = { id: request.id, taskId: task.id, toolName: 'network', args: { origin: url.origin, path: url.pathname, method: string(request.args.method) }, reason: 'Allow this network origin for the requested operation?', createdAt: stamp() };
         this.approvals.set(request.id, approval); task.status = 'waiting'; this.changed(); this.emit('approval', approval);
@@ -810,40 +938,148 @@ export class Harness extends EventEmitter {
     } catch (error) { this.respond(task.id, request.id, undefined, error instanceof Error ? error.message : String(error)); }
   }
   private childSummary(task: Task) {
-    return { id: task.id, title: task.title, name: task.agentName, status: task.status, cwd: task.cwd, sharedReadOnly: task.sharedReadOnly, sharedWorkspace: task.sharedWorkspace, workerActive: this.workers.has(task.id) || this.retiring.has(task.id) || this.starting.has(task.id), result: task.messages.findLast(m => m.role === 'assistant')?.text || '', verification: task.delivery?.verification, error: task.error };
+    return { id: task.id, title: task.title, name: task.agentName, status: task.status, cwd: task.cwd, sharedReadOnly: task.sharedReadOnly, sharedWorkspace: task.sharedWorkspace, readOnly: !!task.readOnly, workerActive: this.workers.has(task.id) || this.retiring.has(task.id) || this.starting.has(task.id), result: task.messages.findLast(m => m.role === 'assistant')?.text || '', verification: task.delivery?.verification, error: task.error };
   }
   private memberName(name: string): string {
     const clean = name.trim(); if (!/[\u3400-\u9fff]/.test(clean) || clean.length < 2 || clean.length > 24 || /[\r\n<>]/.test(clean)) throw new Error('Give the member a suitable Chinese name of 2–24 characters.'); return clean;
   }
+  /**
+   * 成员额度 (Q26): how many members one lead may hold at once — the workbench setting, 6 without it. Saving the setting checks it,
+   * but studio.json is read as it is and may have been edited by hand: a whole number from 1 to 6 counts as itself, a larger one as 6,
+   * a fraction is rounded down, and anything else (0, a negative, text, nothing) as the default 6.
+   */
+  private squadLimit(): number {
+    const size = this.studio?.state.preferences.defaultSquadSize;
+    return typeof size === 'number' && size >= 1 ? Math.min(6, Math.floor(size)) : 6;
+  }
+  /** Members the lead dispatched — a task with a member's name — that are working, queued or being created all count; the lead itself does not, and neither does an agent the user started by hand. */
+  private assertSquadRoom(parent: Task, count: number): void {
+    const held = this.store.state.tasks.filter(task => task.parentId === parent.id && task.agentName && !terminal.has(task.status)).length + (this.admissions.get(parent.id) || 0);
+    const limit = this.squadLimit();
+    if (held + count > limit) throw new Error(`成员额度是 ${limit} 人：现在已有 ${held} 位成员在做或排队，再派 ${count} 位就超了。先用 member_result 等成员回来，再派或少派几位。`);
+  }
   private reserveMembers(parent: Task, count: number): void {
     if (parent.parentId) throw new Error('Child agents cannot delegate further.');
     if (terminal.has(parent.status) || this.workers.get(parent.id)?.cancelling) throw new Error('The parent is no longer accepting child tasks.');
-    const current = this.store.state.tasks.filter(task => task.parentId === parent.id && !terminal.has(task.status)).length;
-    const reserved = this.admissions.get(parent.id) || 0;
-    if (current + reserved + count > 8) throw new Error('At most eight child tasks may be active for one parent.');
-    this.admissions.set(parent.id, reserved + count);
+    this.assertSquadRoom(parent, count);
+    this.admissions.set(parent.id, (this.admissions.get(parent.id) || 0) + count);
   }
-  private async delegateMember(parent: Task, input: { name?: string; title?: string; prompt: string; role: string; squadId?: string }): Promise<Task> {
+  /** The members this card conversation may start now (spec §6.1): by the 子代理 switch, and 查资料 for Ultra planning. */
+  private cardRolesFor(lead: Task): CardMemberRole[] {
+    return cardDispatchRoles({ settings: cardSquadSettings(this.store.state.preferences), sectionId: lead.card?.sectionId ?? '', thinking: lead.thinking, member: !!lead.parentId || !!lead.card?.member });
+  }
+
+  /**
+   * What each member of a card squad may write (spec §6.3), checked for the whole squad before anyone starts: a 写组件's
+   * files exist in the card and are not shared, and no two working writers get the same file or new component.
+   */
+  private async cardSquads(lead: Task, members: ReadonlyArray<{ files: string[]; create: string[] }>, access: readonly MemberAccess[]): Promise<CardSquadAssignment[]> {
+    if (!this.cardStudio) throw new Error('制卡工坊未启用。');
+    const squads: CardSquadAssignment[] = [];
+    for (const [index, member] of members.entries()) {
+      const shape = checkAssignment(access[index].roleId as CardMemberRole, member);
+      squads.push({ ...shape, files: await this.cardStudio.memberFiles(lead.projectId, shape.files) });
+    }
+    // Claimed after the last wait, against the working members and the squads still being started: pi runs the tool calls
+    // of one reply side by side, and two dispatches sent together must not both take a file. The caller releases them.
+    const claims = this.squadHeld(lead);
+    for (const squad of squads) claimAssignment(claims, squad);
+    this.claiming.set(lead.id, [...(this.claiming.get(lead.id) ?? []), ...squads]);
+    return squads;
+  }
+
+  /** What a lead's working writers and the squads being started now hold (spec §6.3); `except` leaves one member's own out. */
+  private squadHeld(lead: Task, except?: string): SquadClaims {
+    const working = this.store.state.tasks.flatMap(sibling => sibling.parentId === lead.id && sibling.id !== except && sibling.card?.squad && !terminal.has(sibling.status) ? [sibling.card.squad] : []);
+    return squadClaims([...working, ...(this.claiming.get(lead.id) ?? [])]);
+  }
+
+  /**
+   * A returned card member sent again runs anew, so it is checked as a new one (spec §6.1, §6.3): its kind must be one the
+   * 子代理 switch allows now, and nothing it holds — its files and the components it created — may have gone to a writer at
+   * work meanwhile. Held like a starting squad's until it is queued; the caller releases it.
+   */
+  private reclaim(lead: Task, member: Task): CardSquadAssignment[] {
+    const squad: CardSquadAssignment = member.card?.squad ?? { role: 'researcher', files: [], create: [] };
+    cardMemberKind(squad.role, this.cardRolesFor(lead));
+    claimAssignment(this.squadHeld(lead, member.id), squad);
+    this.claiming.set(lead.id, [...(this.claiming.get(lead.id) ?? []), squad]);
+    return [squad];
+  }
+
+  /** Once its members exist (or failed to start), their tasks hold what a squad was given. */
+  private releaseClaims(lead: Task, squads?: readonly CardSquadAssignment[]): void {
+    if (!squads?.length) return;
+    const left = (this.claiming.get(lead.id) ?? []).filter(squad => !squads.includes(squad));
+    if (left.length) this.claiming.set(lead.id, left); else this.claiming.delete(lead.id);
+  }
+
+  /**
+   * The subagent a member runs as and whether it may write, decided once when the lead sends it (§3 小事). It only reads
+   * when the lead only reads (it was made read-only, its subagent only reads, or it is planning), when its own subagent only
+   * reads (explorer and planner included, whichever file answers to the name), or when the lead's worker asked for it;
+   * nothing upgrades it later. Card members are decided by their kind (spec §6.1).
+   */
+  private memberAccess(parent: Task, requested: string, askedReadOnly: boolean): MemberAccess {
+    // A card conversation sends 查资料 or 写组件 as far as the 子代理 switch allows (spec §6.1); only 查资料 reads.
+    if (parent.card) { const role = cardMemberKind(requested, this.cardRolesFor(parent)); return { roleId: role, readOnly: role === 'researcher' }; }
+    const roles = this.roles(parent.projectId);
+    const usable = usableAgents(roles, parent.projectId);
+    const role = findRole(usable, requested || 'executor');
+    if (!role) {
+      // One that exists but is switched off is named as such, so the lead (and the user reading) can tell it from a name nobody has.
+      const off = findRole(roles.filter(item => item.enabled === false && (!item.projectId || item.projectId === parent.projectId)), requested);
+      throw new Error(`${off ? `子代理「${off.name}」已关闭。` : `没有可用的子代理「${requested}」。`}可用的有：${usable.map(dispatchName).join('、')}。`);
+    }
+    const lead = findRole(roles, parent.role || 'executor');
+    return { roleId: role.id, readOnly: askedReadOnly || !!parent.readOnly || !!parent.planMode || !lead || readsOnly(lead) || readsOnly(role) };
+  }
+  private async delegateMember(parent: Task, input: { name?: string; title?: string; prompt: string; role: string; squadId?: string }, access: MemberAccess, squad?: CardSquadAssignment): Promise<Task> {
     if (!input.prompt.trim() || input.prompt.length > 200000) throw new Error('A child task requires a bounded, non-empty prompt.');
     const epoch = this.cancellationEpochs.get(parent.id) || 0;
     const project = this.store.state.projects.find(project => project.id === parent.projectId)!;
     const isolated = await canCreateIsolatedTasks(project);
     if ((this.cancellationEpochs.get(parent.id) || 0) !== epoch || terminal.has(parent.status) || this.workers.get(parent.id)?.cancelling) throw new Error('The parent stopped while preparing its squad.');
-    // Without a separate worktree, writing members share the lead's folder; planning leads and read-only roles keep read-only members.
-    const roles = this.store.state.ecosystem.roles;
-    const role = parent.card || parent.planMode || roles.find(item => item.id === parent.role)?.readOnly ? 'Explore' : input.role;
-    const readOnly = !!roles.find(item => item.id === role)?.readOnly;
-    const name = input.name ? this.memberName(input.name) : `${role === 'Explore' ? '探索员' : role === 'Plan' ? '规划师' : '执行员'}${this.store.state.tasks.filter(task => task.parentId === parent.id).length + 1}`;
-    const model = this.studio?.state.preferences.roleModels[role];
-    return this.createTask({ projectId: parent.projectId, prompt: input.prompt, title: input.title || name, agentName: name, squadId: input.squadId, sharedReadOnly: !isolated && readOnly, sharedWorkspace: !isolated && !readOnly, ...(parent.card ? { card: { sectionId: parent.card.sectionId, member: true } } : {}), gatewayId: model?.gatewayId || parent.gatewayId, modelId: model?.modelId || parent.modelId, contextWindow: parent.contextWindow, thinking: model?.thinking as ThinkingLevel || (parent.thinking === 'ultra' ? 'max' : parent.thinking), permission: parent.permission, parentId: parent.id, isolated, role });
+    const { roleId, readOnly } = access;
+    // A card member (spec §6): the lead's section, gateway, model and effort, in the card folder, and auto edit — it never asks.
+    if (parent.card) {
+      if (!squad) throw new Error('A card member is started with its assignment.');
+      const name = input.name ? this.memberName(input.name) : this.nextMemberName(parent, squad.role === 'writer' ? '写手' : '资料员', this.store.state.tasks.filter(task => task.parentId === parent.id && task.card?.squad?.role === squad.role).length);
+      // Held until the member exists: the folder may still be winding down another member, and pi sends one reply's dispatches side by side.
+      const naming = this.naming.get(parent.id) ?? new Set<string>();
+      naming.add(name); this.naming.set(parent.id, naming);
+      try {
+        return await this.createTask({
+          projectId: parent.projectId, prompt: input.prompt, title: input.title || `${CARD_ROLES[squad.role].label} · ${name}`, agentName: name, squadId: input.squadId, role: roleId,
+          sharedReadOnly: readOnly, sharedWorkspace: !readOnly, readOnly,
+          card: { sectionId: parent.card.sectionId, member: true, squad, web: parent.card.web === true, ...(parent.card.mode ? { mode: parent.card.mode } : {}) },
+          gatewayId: parent.gatewayId, modelId: parent.modelId, contextWindow: parent.contextWindow, thinking: parent.thinking === 'ultra' ? 'max' : parent.thinking,
+          permission: 'edit', parentId: parent.id, isolated: false,
+        });
+      } finally { naming.delete(name); if (!naming.size && this.naming.get(parent.id) === naming) this.naming.delete(parent.id); }
+    }
+    // Without a separate worktree, writing members share the lead's folder and read-only ones read it.
+    const name = input.name ? this.memberName(input.name) : `${roleId === 'explorer' ? '探索员' : roleId === 'planner' ? '规划师' : '执行员'}${this.store.state.tasks.filter(task => task.parentId === parent.id).length + 1}`;
+    const model = this.studio?.state.preferences.roleModels[roleId];
+    return this.createTask({ projectId: parent.projectId, prompt: input.prompt, title: input.title || name, agentName: name, squadId: input.squadId, sharedReadOnly: !isolated && readOnly, sharedWorkspace: !isolated && !readOnly, readOnly, gatewayId: model?.gatewayId || parent.gatewayId, modelId: model?.modelId || parent.modelId, contextWindow: parent.contextWindow, thinking: model?.thinking as ThinkingLevel || (parent.thinking === 'ultra' ? 'max' : parent.thinking), permission: parent.permission, parentId: parent.id, isolated, role: roleId });
+  }
+  /** An unnamed card member's name: 资料员N / 写手N after the `count` of its kind, skipping names taken or being given now. */
+  private nextMemberName(parent: Task, prefix: string, count: number): string {
+    const taken = new Set([...this.store.state.tasks.flatMap(task => task.parentId === parent.id && task.agentName ? [task.agentName] : []), ...(this.naming.get(parent.id) ?? [])]);
+    let index = count + 1;
+    while (taken.has(`${prefix}${index}`)) index++;
+    return `${prefix}${index}`;
   }
   async resumeAgent(id: string, message: string): Promise<void> {
     const child = this.task(id); if (!child.parentId) throw new Error('Select a squad member.');
     if (!message.trim()) throw new Error('Describe the follow-up task.');
     const parent = this.task(child.parentId);
     if (this.workers.get(parent.id)?.cancelling) throw new Error('The lead is stopping its squad.');
-    if (!this.workers.has(id)) { child.permission = parent.permission; if (terminal.has(parent.status) && !this.store.state.tasks.some(task => task.parentId === parent.id && !terminal.has(task.status))) { this.budgetBaselines.set(parent.id, budgetUsage(this.store.state.tasks.filter(task => task.id === parent.id || task.parentId === parent.id))); this.budgetStarts.set(parent.id, Date.now()); this.budgetStopping.delete(parent.id); } }
-    await this.prompt(id, message, this.workers.has(id) ? 'steer' : undefined);
+    const claimed = child.card?.member && !this.workers.has(id) && terminal.has(child.status) ? this.reclaim(parent, child) : undefined;
+    try {
+      if (!this.workers.has(id)) { child.permission = child.card?.member ? 'edit' : parent.permission; if (terminal.has(parent.status) && !this.store.state.tasks.some(task => task.parentId === parent.id && !terminal.has(task.status))) { this.budgetBaselines.set(parent.id, budgetUsage(this.store.state.tasks.filter(task => task.id === parent.id || task.parentId === parent.id))); this.budgetStarts.set(parent.id, Date.now()); this.budgetStopping.delete(parent.id); } }
+      await this.prompt(id, message, this.workers.has(id) ? 'steer' : undefined);
+    } finally { this.releaseClaims(parent, claimed); }
   }
   private checkWaiters(): void {
     for (const [id, waiter] of this.waiters) {
@@ -868,6 +1104,8 @@ export class Harness extends EventEmitter {
     this.changed();
   }
   private cleanupRequests(taskId: string): void {
+    for (const controller of this.slotWaits.get(taskId) ?? []) controller.abort();
+    this.slotWaits.delete(taskId);
     for (const [id, interaction] of this.interactions) if (interaction.taskId === taskId) {
       this.interactions.delete(id);
       const local = this.localAnswers.get(id); if (local) { this.localAnswers.delete(id); local(null); }
@@ -875,6 +1113,7 @@ export class Harness extends EventEmitter {
     for (const [id, approval] of this.approvals) if (approval.taskId === taskId) this.approvals.delete(id);
     this.waiters.delete(taskId);
     const task = this.task(taskId);
+    delete task.net;
     for (const tool of task.tools) {
       if (tool.status === 'waiting' || tool.status === 'running') {
         tool.status = 'failed';
@@ -886,7 +1125,8 @@ export class Harness extends EventEmitter {
     this.cancellationEpochs.set(id, (this.cancellationEpochs.get(id) || 0) + 1);
     for (const child of this.store.state.tasks.filter(task => task.parentId === id && !terminal.has(task.status))) void this.cancelTask(child.id);
   }
-  private retire(id: string, graceful = false): void {
+  /** `afterSeal` runs once the worker has exited and the turn is sealed (a card lead's once its squad has stopped too). */
+  private retire(id: string, graceful = false, afterSeal?: () => void): void {
     const running = this.workers.get(id);
     if (!running) return;
     this.workers.delete(id);
@@ -905,10 +1145,15 @@ export class Harness extends EventEmitter {
       clearTimeout(timeout);
       const task = this.task(id);
       this.forgetUnwrittenSession(task);
-      if (this.studio && ['failed', 'cancelled'].includes(task.status)) {
+      // A card lead's turn ends once its squad has stopped, and only then is it sealed: its checkpoint holds what the members
+      // wrote, so 撤销本轮 takes that back too (spec §6.6). Until then the lead still counts as winding down.
+      const lead = this.leadsCardSquad(task);
+      if (lead) await this.membersStopped(id);
+      if (this.studio && (lead || ['failed', 'cancelled'].includes(task.status))) {
         try { await this.studio.afterRun(task); }
         catch (error) { if (task.delivery) { task.delivery.verification = 'failed'; task.delivery.error = error instanceof Error ? error.message : String(error); } }
       }
+      afterSeal?.();
       if (this.retiring.get(id)?.child === child) this.retiring.delete(id);
       settle(); this.changed(); this.checkWaiters(); this.pump();
     })(); };
@@ -928,9 +1173,16 @@ export class Harness extends EventEmitter {
     const task = this.task(id);
     task.error = this.redactString(message); task.status = this.workers.get(id)?.cancelling ? 'cancelled' : 'failed';
     task.updatedAt = stamp(); task.completedAt = task.updatedAt; this.stopChildren(id); this.prompts.delete(id); unqueue(task); this.cleanupRequests(id);
-    this.retire(id); this.changed(); this.emit('finished', structuredClone(task)); if (task.card) void this.cardStudio?.afterConversation(task); this.checkWaiters();
+    // A worker winding down is sealed first and the books follow (retire); with none there is no turn to seal.
+    const winding = this.workers.has(id);
+    this.retire(id, false, () => this.cardBooks(task)); this.changed(); this.emit('finished', structuredClone(task)); if (!winding) this.cardBooks(task); this.checkWaiters();
     queueMicrotask(() => this.pump());
   }
+  /**
+   * The card's books for a conversation whose run ended (spec §6.6): dispatches, the 改动单, the variable sync, one-click
+   * making. They come after the turn's seal, so 撤销本轮 takes back what the turn wrote, never the app's record of it.
+   */
+  private cardBooks(task: Task): void { if (task.card) void this.cardStudio?.afterConversation(task); }
   async cancelTask(id: string): Promise<void> {
     const task = this.task(id);
     this.cancellationEpochs.set(id, (this.cancellationEpochs.get(id) || 0) + 1);
@@ -940,12 +1192,16 @@ export class Harness extends EventEmitter {
     if (running) {
       running.cancelling = true; this.send(id, { type: 'cancel' });
       this.cleanupRequests(id);
+      // A member is stopped twice when its lead stops (once with the lead, once when the lead's run ends): one timer, never a stale one.
+      if (running.killTimer) clearTimeout(running.killTimer);
       running.killTimer = setTimeout(() => { task.status = 'cancelled'; task.completedAt = stamp(); task.contextCompacting = false; this.retire(id); this.changed(); this.checkWaiters(); this.pump(); }, 8000);
     } else { task.status = 'cancelled'; task.completedAt = stamp(); this.checkWaiters(); }
     task.updatedAt = stamp(); this.changed(); this.pump();
   }
   updateTask(id: string, changes: { title?: string; permission?: PermissionMode; gatewayId?: string; modelId?: string; contextWindow?: number; thinking?: ThinkingLevel; archived?: boolean; pinned?: boolean; jailbreak?: JailbreakChoice | null }): void {
     const task = this.task(id);
+    // A card member runs on auto edit with its lead's gateway, model and effort, fixed when it was sent (spec §6.2).
+    if (task.card?.member && (['permission', 'gatewayId', 'modelId', 'contextWindow', 'thinking'] as const).some(key => changes[key] !== undefined)) throw new Error('小队成员的权限、模型和思考强度跟着主 AI，不能单独改。');
     const selectionChanged = changes.gatewayId !== undefined || changes.modelId !== undefined || changes.contextWindow !== undefined;
     if ((selectionChanged || changes.thinking !== undefined) && !terminal.has(task.status)) throw new Error('Stop this task before changing its model, context window or reasoning level.');
     if (changes.title !== undefined && (typeof changes.title !== 'string' || !changes.title.trim())) throw new Error('Task title cannot be empty.');
@@ -1004,11 +1260,24 @@ export class Harness extends EventEmitter {
     if (!running && !this.retiring.has(id) && !task.messages.find(message => message.id === userMessageId)?.pending) throw new Error('这条消息已经写完了。要改它，请用【编辑并重新生成】。');
     if (running) await this.cancelTask(id);
     await this.stopped(id);
+    // Members write into the same folder: 撤销本轮 right after 撤回 needs them stopped too (spec Q18, §6.6).
+    for (const member of this.store.state.tasks.filter(item => item.parentId === id)) await this.stopped(member.id);
     this.restoreMessageCursors(task);
     const withdrawal = withdrawTurn(task, userMessageId);
     task.updatedAt = stamp();
     this.changed();
     return withdrawal;
+  }
+  /** A card conversation, which may lead a squad of 查资料 and 写组件 members in its own folder (spec §6). */
+  private leadsCardSquad(task: Task): boolean { return !!task.card && !task.card.member; }
+  /**
+   * A card lead's members work in its folder and its checkpoint covers their writes (spec §6.6), so its turn is sealed only
+   * once none of them runs, starts or winds down. cancelTask's kill timer bounds the wait; a closing app does not wait.
+   */
+  private async membersStopped(id: string): Promise<void> {
+    const end = Date.now() + 12_000;
+    const working = () => this.store.state.tasks.some(item => item.parentId === id && (this.workers.has(item.id) || this.starting.has(item.id) || this.retiring.has(item.id)));
+    while (!this.closing && working() && Date.now() < end) await new Promise(done => setTimeout(done, 25));
   }
   /** Resolves once no worker runs, starts or winds down for the task; cancelTask's kill timer bounds the wait. */
   private async stopped(id: string): Promise<void> {
@@ -1043,13 +1312,23 @@ export class Harness extends EventEmitter {
     if (typeof next.name !== 'string' || next.name.length > 80 || typeof next.instructions !== 'string' || next.instructions.length > 40_000) throw new Error('Name or instructions are too long.');
     if (!Array.isArray(next.skillPaths) || next.skillPaths.some(p => typeof p !== 'string')) throw new Error('Skill folders must be paths.');
     if (next.developerMode !== undefined && typeof next.developerMode !== 'boolean') throw new Error('开发者模式只能打开或关闭。');
-    for (const key of ['notifyFinished', 'notifyApproval', 'bootSequence', 'quietUpgrade', 'releaseCheck'] as const) if (next[key] !== undefined && typeof next[key] !== 'boolean') throw new Error('These switches are on or off.');
+    for (const key of ['notifyFinished', 'notifyApproval', 'bootSequence', 'quietUpgrade', 'releaseCheck', 'persona'] as const) if (next[key] !== undefined && typeof next[key] !== 'boolean') throw new Error('These switches are on or off.');
     if (next.cardHandoff !== undefined) {
       const { tokens, windowPercent } = (next.cardHandoff ?? {}) as { tokens?: unknown; windowPercent?: unknown };
       if (!Number.isInteger(tokens) || (tokens as number) < 10_000 || (tokens as number) > 10_000_000 || !Number.isInteger(windowPercent) || (windowPercent as number) < 10 || (windowPercent as number) > 90) throw new Error('换对话阈值要在 1 万到 1000 万 Token、窗口的 10% 到 90% 之间。');
       next.cardHandoff = { tokens: tokens as number, windowPercent: windowPercent as number };
     }
+    if (next.cardSquad !== undefined) {
+      const squad = next.cardSquad as unknown as Record<string, unknown> | null;
+      if (!squad || typeof squad !== 'object' || !CARD_SQUAD_MODES.includes(squad.mode as CardSquadMode)) throw new Error('「子代理」只能是关、只读或可写。');
+      if (typeof squad.selfDispatch !== 'boolean') throw new Error('「自行组队」只能打开或关闭。');
+      next.cardSquad = { mode: squad.mode as CardSquadMode, selfDispatch: squad.selfDispatch };
+    }
     if (next.disabledSkillIds !== undefined && (!Array.isArray(next.disabledSkillIds) || next.disabledSkillIds.some(id => typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id)))) throw new Error('Invalid disabled skill IDs.');
+    for (const key of ['disabledAgentIds', 'enabledAgentIds'] as const) {
+      const ids: unknown = next[key];
+      if (ids !== undefined && (!Array.isArray(ids) || ids.length > 500 || ids.some(id => typeof id !== 'string' || !id || id.length > 300))) throw new Error('子代理开关的记录无效。');
+    }
     if (next.skillPaths.some(path => { try { return !statSync(path).isDirectory(); } catch { return true; } })) throw new Error('Select an existing, readable skill folder.');
     this.store.state.preferences = next; this.refreshSkills(); this.changed(); this.pump();
   }
@@ -1091,7 +1370,11 @@ export class Harness extends EventEmitter {
     if (input.provider === 'brave' && input.enabled && !key) throw new Error('Enter a Brave Search API key before enabling search.');
     if (apiKey !== undefined && input.provider === 'brave') this.vault.set('search:brave', key);
     this.store.state.search = { enabled: input.enabled, provider: input.provider, baseUrl, hasKey: this.vault.has('search:brave') };
-    for (const taskId of this.workers.keys()) this.send(taskId, { type: 'search', search: { ...this.store.state.search, apiKey: key } });
+    // A card conversation and its members stay on their own 联网 switch, as start() gave it to them: a member searches without asking.
+    for (const taskId of this.workers.keys()) {
+      const card = this.store.state.tasks.find(item => item.id === taskId)?.card;
+      this.send(taskId, { type: 'search', search: { ...this.store.state.search, ...(card ? { enabled: card.web === true } : {}), apiKey: key } });
+    }
     for (const approval of [...this.approvals.values()]) if (approval.toolName === 'web_search') this.approve(approval.id, false);
     this.changed();
   }
@@ -1110,8 +1393,9 @@ export class Harness extends EventEmitter {
     if (!input.name?.trim() || input.name.length > 120 || !input.id || !/^[a-zA-Z0-9_-]{1,100}$/.test(input.id)) throw new Error('Enter a valid gateway name and identifier.');
     if (!['openai-completions', 'openai-responses', 'anthropic-messages'].includes(input.protocol)) throw new Error('Unknown API protocol.');
     if (input.upstream !== undefined && !isGatewayUpstream(input.upstream)) throw new Error('Unknown upstream service.');
-    if (input.rateLimit !== undefined && (typeof input.rateLimit !== 'object' || !input.rateLimit || typeof input.rateLimit.enabled !== 'boolean' || !Number.isInteger(input.rateLimit.perMinute) || input.rateLimit.perMinute < 1 || input.rateLimit.perMinute > 10000)) throw new Error('Requests per minute must be a whole number between 1 and 10,000.');
-    if (input.retry !== undefined && (typeof input.retry !== 'object' || !input.retry || !Number.isInteger(input.retry.maxRetries) || input.retry.maxRetries < 0 || input.retry.maxRetries > 10)) throw new Error('Retries must be a whole number between 0 and 10.');
+    if (input.rateLimit !== undefined && !validRateLimit(input.rateLimit)) throw new Error('Requests per minute must be a whole number between 1 and 10,000.');
+    if (input.retry !== undefined && !validRetry(input.retry)) throw new Error('Retries must be a whole number between 0 and 10.');
+    if (input.stall !== undefined && !validStall(input.stall)) throw new Error('Disconnect when silent takes a whole number of seconds from 15 to 300, or nothing. / 无响应断开要填 15 到 300 之间的整数秒，或者留空。');
     if (apiKey !== undefined && (typeof apiKey !== 'string' || apiKey.length > 8192)) throw new Error('Invalid API key.');
     const baseUrl = input.protocol === 'anthropic-messages' ? input.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '') : input.baseUrl.replace(/\/+$/, '');
     const proposed: Gateway = { ...input, baseUrl, hasKey: false, defaultsVersion: 6 };
@@ -1120,10 +1404,8 @@ export class Harness extends EventEmitter {
     if (!models.some(model => model.id === defaultId)) throw new Error('Choose a default model included in this gateway.');
     const selected = resolveGatewayModel({ ...proposed, models }, defaultId);
     const gateway: Gateway = { id: input.id, name: input.name.trim(), baseUrl, protocol: input.protocol, hasKey: false, models,
-      // 'auto' is the absent state, so an unset upstream keeps the address match.
-      ...(input.upstream && input.upstream !== 'auto' ? { upstream: input.upstream } : {}),
-      ...(input.rateLimit ? { rateLimit: { enabled: input.rateLimit.enabled, perMinute: input.rateLimit.perMinute } } : {}),
-      ...(input.retry ? { retry: { maxRetries: input.retry.maxRetries } } : {}),
+      // 'auto' is the absent upstream, so an unset one keeps the address match; any absent field is off.
+      ...trafficSettings(input),
       modelId: selected.modelId, reasoning: selected.reasoning, contextWindow: selected.contextWindow, maxTokens: selected.maxTokens, effortMap: selected.effortMap, adaptiveThinking: selected.adaptiveThinking, nativeSearch: selected.nativeSearch, defaultsVersion: 6 };
     for (const model of models) { const resolved = resolveGatewayModel(gateway, model.id); if (resolved.nativeSearch?.enabled) nativeSearchEndpoint(resolved); }
     const previous = this.store.state.gateways.find(item => item.id === gateway.id);
@@ -1332,15 +1614,25 @@ export class Harness extends EventEmitter {
     this.skills = discoverSkills({ projects: this.store.state.projects, customPaths: this.store.state.preferences.skillPaths, disabledIds: this.store.state.preferences.disabledSkillIds || [], bundledPaths, homeDir: process.env.CARDWRIGHT_SKILL_HOME });
     this.agents = discoverAgents({ projects: this.store.state.projects, homeDir: process.env.CARDWRIGHT_SKILL_HOME });
   }
-  /** Built-in roles, the user's own, and the subagents discovered for this project (§6.2). */
+  /** Built-in roles, the user's own, and the subagents discovered for this project (§6.2); a project's own start off (Q25). */
   roles(projectId?: string): AgentRole[] {
-    return mergeAgents({ saved: this.store.state.ecosystem.roles, discovered: this.agents, disabled: this.store.state.preferences.disabledAgentIds || [], projectId });
+    const preferences = this.store.state.preferences;
+    return mergeAgents({ saved: this.store.state.ecosystem.roles, discovered: this.agents, disabled: preferences.disabledAgentIds || [], enabled: preferences.enabledAgentIds || [], projectId });
   }
+  /** A project folder's subagent is turned on by listing it in enabledAgentIds; every other one is turned off by listing it in disabledAgentIds. */
   setAgentEnabled(id: string, enabled: boolean): void {
-    if (typeof enabled !== 'boolean' || !this.roles().some(role => role.id === id)) throw new Error('Select a subagent.');
-    const disabled = new Set(this.store.state.preferences.disabledAgentIds || []);
-    if (enabled) disabled.delete(id); else disabled.add(id);
-    this.store.state.preferences.disabledAgentIds = [...disabled]; this.changed();
+    const roleId = canonicalRoleId(String(id));
+    const role = this.roles().find(item => item.id === roleId);
+    if (typeof enabled !== 'boolean' || !role) throw new Error('Select a subagent.');
+    const preferences = this.store.state.preferences;
+    const disabled = new Set(preferences.disabledAgentIds || []);
+    if (role.source === 'project') {
+      const switchedOn = new Set(preferences.enabledAgentIds || []);
+      if (enabled) { switchedOn.add(roleId); disabled.delete(roleId); } else switchedOn.delete(roleId);
+      preferences.enabledAgentIds = [...switchedOn];
+    } else if (enabled) disabled.delete(roleId);
+    else disabled.add(roleId);
+    preferences.disabledAgentIds = [...disabled]; this.changed();
   }
   setSkillEnabled(id: string, enabled: boolean): void {
     if (typeof enabled !== 'boolean' || !this.skills.some(skill => skill.id === id)) throw new Error('Select a discovered skill.');
@@ -1369,8 +1661,11 @@ export class Harness extends EventEmitter {
   async approvePlan(id: string): Promise<void> {
     const task = this.task(id);
     if (this.workers.has(id) || !task.plan || task.plan.status !== 'pending') throw new Error('Wait for a complete proposed plan before approving.');
-    if (task.sharedReadOnly) throw new Error('A shared read-only member can propose a plan; ask the lead to implement it.');
-    task.plan.status = 'approved'; task.planMode = false; task.role = 'general-purpose'; this.changed();
+    // A member's read-only is for good (ADR 0007), whether it carries the flag or, made before 1.3, only has a subagent that reads. A top-level task the user approves becomes an executor that writes, as approving always made it.
+    if (task.parentId && (task.readOnly || task.sharedReadOnly || this.roleReadsOnly(task))) throw new Error('这个成员是只读的：它可以提方案，但不能自己动手。请让主代理按方案去做。');
+    // The approved plan runs as an executor: check that it can before the task changes, so a refused run leaves the plan waiting for approval.
+    this.roleToRun(task.projectId, 'executor');
+    task.plan.status = 'approved'; task.planMode = false; task.role = 'executor'; delete task.readOnly; this.changed();
     await this.prompt(id, `Implement this user-approved plan. Track the steps with todo and verify the result.\n\n${task.plan.text}`);
   }
   async command(id: string, input: string): Promise<void> {
@@ -1399,14 +1694,18 @@ export class Harness extends EventEmitter {
     Object.assign(this.store.state.ecosystem, changes); this.changed();
   }
   saveAgentRole(role: AgentRole): void {
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(role.id) || !role.name.trim() || !role.prompt.trim() || role.prompt.length > 20_000 || typeof role.readOnly !== 'boolean') throw new Error('Enter a valid role ID, name and prompt.');
-    if (defaultEcosystem().roles.some(item => item.id.toLowerCase() === role.id.toLowerCase())) throw new Error('Built-in roles cannot be overwritten. Create a custom role.');
+    if (!CUSTOM_ROLE_ID.test(role.id) || !role.name.trim() || !role.prompt.trim() || role.prompt.length > 20_000 || typeof role.readOnly !== 'boolean') throw new Error('Enter a valid role ID, name and prompt.');
+    if (role.description !== undefined && (typeof role.description !== 'string' || role.description.length > 300)) throw new Error('「说明」最多 300 个字。');
+    if (isReservedRoleId(role.id)) throw new Error('Built-in roles cannot be overwritten. Create a custom role.');
     if (this.store.state.tasks.some(task => task.role === role.id && !terminal.has(task.status))) throw new Error('Stop tasks using this role before editing it.');
-    const roles = this.store.state.ecosystem.roles; const saved = { id: role.id, name: role.name.trim(), prompt: role.prompt, readOnly: role.readOnly, builtIn: false };
+    // 说明: the one line the lead reads when it picks a member; empty means the first line of the instructions (roleDescription).
+    const description = role.description?.trim().replace(/\s+/g, ' ');
+    const roles = this.store.state.ecosystem.roles; const saved: AgentRole = { id: role.id, name: role.name.trim(), prompt: role.prompt, readOnly: role.readOnly, builtIn: false, ...(description ? { description } : {}) };
     const index = roles.findIndex(item => item.id === role.id); if (index < 0) roles.push(saved); else roles[index] = saved; this.changed();
   }
   removeAgentRole(id: string): void {
-    if (this.store.state.ecosystem.roles.some(role => role.id === id && role.builtIn)) throw new Error('Built-in roles cannot be removed.');
+    if (typeof id !== 'string') throw new Error('Select a role to remove.');
+    if (isReservedRoleId(id) || this.store.state.ecosystem.roles.some(role => role.id === id && role.builtIn)) throw new Error('Built-in roles cannot be removed.');
     if (this.store.state.tasks.some(task => task.role === id && !terminal.has(task.status))) throw new Error('Stop tasks using this role first.');
     this.store.state.ecosystem.roles = this.store.state.ecosystem.roles.filter(role => role.id !== id); this.changed();
   }
@@ -1430,7 +1729,7 @@ export class Harness extends EventEmitter {
   async listMemories(projectId: string, query?: string): Promise<MemoryItem[]> { const memory = await this.memory(projectId); try { return (query?.trim() ? memory.search(query) : memory.list()).map(item => ({ id: 'source' in item && item.source === 'journal' ? `journal:${item.id}` : String(item.id), content: item.content, category: item.category, source: 'sourceType' in item ? item.sourceType : 'source' in item ? item.source : undefined, createdAt: 'createdAt' in item ? new Date(item.createdAt).toISOString() : undefined })); } finally { memory.close(); } }
   async writeMemory(projectId: string, content: string): Promise<void> { const memory = await this.memory(projectId); try { memory.write({ content, source: 'agent', category: 'USER_DIRECTIVES' }); } finally { memory.close(); } }
   async archiveMemory(projectId: string, id: string): Promise<void> { if (!Number.isSafeInteger(Number(id)) || Number(id) < 1) throw new Error('Invalid memory ID.'); const memory = await this.memory(projectId); try { memory.archive(Number(id)); } finally { memory.close(); } }
-  async dreamMemory(projectId: string): Promise<Task> { if (!this.store.state.ecosystem.memoryEnabled) throw new Error('Enable project memory first.'); return this.createTask({ projectId, title: 'Dreamer · 项目记忆整理', prompt: '/dream', isolated: false, role: 'Explore' }); }
+  async dreamMemory(projectId: string): Promise<Task> { if (!this.store.state.ecosystem.memoryEnabled) throw new Error('Enable project memory first.'); return this.createTask({ projectId, title: 'Dreamer · 项目记忆整理', prompt: '/dream', isolated: false, readOnly: true }, DREAMER_ROLE); }
   saveWebdav(config: { url: string; username: string }, password?: string): void {
     if (config.url) { const url = new URL(config.url); if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error('Enter a WebDAV root URL without embedded credentials.'); }
     if (typeof config.username !== 'string' || config.username.length > 500 || (password !== undefined && (typeof password !== 'string' || password.length > 8192))) throw new Error('Invalid WebDAV account.');
@@ -1447,14 +1746,16 @@ export class Harness extends EventEmitter {
       const incoming = gatewayModels(gateway);
       // Keep additional local models so restoring an older backup cannot orphan a task.
       const models = [...incoming, ...(existing ? gatewayModels(existing).filter(model => !incoming.some(item => item.id === model.id)) : [])];
-      this.saveGateway({ ...gateway, models });
+      // A backup carries no traffic settings (资料备份 keeps a fixed set of fields), so the local ones stay.
+      this.saveGateway(keepLocalTraffic({ ...gateway, models }, existing));
     }
     // A theme pack that is not installed here keeps the current theme rather than failing the restore.
     const theme = this.knownTheme(data.preferences.theme) ? data.preferences.theme : this.store.state.preferences.theme;
     this.savePreferences({ ...data.preferences, theme, skillPaths: [...new Set([...this.store.state.preferences.skillPaths, ...data.importedSkillPaths.map(path => dirname(path))])] });
     this.saveSearch({ ...data.search, enabled: data.search.provider === 'brave' ? this.vault.has('search:brave') && data.search.enabled : data.search.enabled });
     this.saveEcosystem({ memoryEnabled: data.ecosystem.memoryEnabled, cacheEnabled: data.ecosystem.cacheEnabled, showStatusline: data.ecosystem.showStatusline, compactTools: data.ecosystem.compactTools });
-    for (const role of data.ecosystem.roles) if (!defaultEcosystem().roles.some(item => item.id === role.id)) this.saveAgentRole({ ...role, builtIn: false });
+    // 1.3.0: built-in roles come from the app; a restored custom role on a now-reserved id keeps its prompt under <id>-custom.
+    for (const role of savedCustomRoles(data.ecosystem.roles).roles) this.saveAgentRole({ ...role, builtIn: false });
     for (const server of data.ecosystem.mcpServers) this.saveMcpServer({ ...server, enabled: false });
     for (const group of data.memories) {
       const matches = this.store.state.projects.filter(p => p.name === group.projectName);
@@ -1472,8 +1773,14 @@ export class Harness extends EventEmitter {
     this.studio?.stopChecks();
     while (this.starting.size) await new Promise(resolve => setTimeout(resolve, 20));
     for (const id of [...this.workers.keys()]) {
+      // Stop first: a worker sends a request whose slot was refused all the same, unless its run was told to stop before the
+      // refusal came. Marking it as stopping also refuses a slot request that is still on its way (see rate-slot).
+      const running = this.workers.get(id); if (running) running.cancelling = true;
       this.send(id, { type: 'cancel' }); this.task(id).status = 'cancelled'; unqueue(this.task(id));
     }
+    // Only then give the waits up (each is refused), so no timer holds the process open for a minute.
+    for (const waits of this.slotWaits.values()) for (const controller of waits) controller.abort();
+    this.slotWaits.clear();
     await new Promise(resolve => setTimeout(resolve, this.workers.size ? 1500 : 0));
     for (const id of [...this.workers.keys()]) this.retire(id);
     await Promise.all([...this.retiring.values()].map(value => value.finished));

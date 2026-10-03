@@ -1,5 +1,6 @@
 import type { ChatMessage, Task, ToolCall } from './types.ts';
 import { tokenTotals } from './usage.ts';
+import { assistantName } from './identity.ts';
 
 /**
  * A conversation as a Markdown document: the messages in order, the thinking
@@ -47,7 +48,7 @@ export interface TranscriptOptions {
   gatewayName?: string;
 }
 
-export function buildTranscript(task: Pick<Task, 'title' | 'messages' | 'tools' | 'createdAt' | 'updatedAt' | 'modelId' | 'cwd'>, options: TranscriptOptions = {}): string {
+export function buildTranscript(task: Pick<Task, 'title' | 'messages' | 'tools' | 'createdAt' | 'updatedAt' | 'modelId' | 'cwd' | 'agentName' | 'card'>, options: TranscriptOptions = {}): string {
   const usage = task.messages.reduce((total, message) => total + tokenTotals(message.usage).total, 0);
   const out: string[] = [
     `# ${task.title}`,
@@ -72,7 +73,7 @@ export function buildTranscript(task: Pick<Task, 'title' | 'messages' | 'tools' 
   }
   const seen = new Set<string>();
 
-  const label = (message: ChatMessage) => message.role === 'user' ? 'You' : message.role === 'assistant' ? 'Cardwright' : 'System';
+  const label = (message: ChatMessage) => message.role === 'user' ? 'You' : message.role === 'assistant' ? assistantName(task) : 'System';
   for (const message of task.messages) {
     const turn = message.turnId ?? message.id;
     const chapter = chapters.get(turn);

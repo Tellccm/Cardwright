@@ -2,6 +2,7 @@ import { useState, type CSSProperties } from 'react';
 import { useApp } from './context';
 import { Mark } from './primitives';
 import { AvatarCropper } from './AvatarCropper';
+import { ASSISTANT_NAME } from '../shared/identity';
 
 const memberHues = ['var(--accent)', 'var(--info)', 'var(--success)', 'var(--warning)'];
 const hash = (value: string) => Array.from(value).reduce((sum, char) => (sum * 31 + char.codePointAt(0)!) >>> 0, 7);
@@ -23,7 +24,7 @@ export function Avatar({ role, size = 34, interactive = false, agentName }: { ro
   const changer = useAvatarChanger(role);
   const saved = data.preferences.avatars?.[role];
   const member = role === 'assistant' && agentName ? agentName : undefined;
-  const name = role === 'assistant' ? member || 'Cardwright' : data.preferences.name || t('You', '你');
+  const name = role === 'assistant' ? member || ASSISTANT_NAME : data.preferences.name || t('You', '你');
   const style = { '--avatar-size': `${size}px`, ...(member && !saved ? { '--member-hue': memberHues[hash(member) % memberHues.length] } : {}) } as CSSProperties;
   const className = `avatar avatar-${role} portrait is-${role} ${saved ? 'avatar-uploaded' : ''} ${member && !saved ? 'is-member' : ''} ${size >= 64 ? 'is-large' : ''}`;
   const content = <>

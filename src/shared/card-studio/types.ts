@@ -47,10 +47,23 @@ export interface CardChange {
  */
 export interface CardHandoffState { status: 'requested' | 'ready' | 'failed' | 'consumed'; at: string; requestId?: string; summary?: string; /** Requested by one-click making, which sends the summary itself; the UI opens no draft. */ auto?: boolean }
 /** Stored on a task that is a section conversation of a card project. */
-export interface CardTaskInfo { sectionId: string; dispatchId?: string; mode?: PlanMode; web?: boolean; handoff?: CardHandoffState; /** A read-only member of an Ultra planning squad, not a conversation of its own. */ member?: boolean; /** The conversation began with the (possibly overridden) kickoff line. */ kickoff?: boolean; /** The change AI's conversation of this 改动单. */ changeId?: string }
+export interface CardTaskInfo { sectionId: string; dispatchId?: string; mode?: PlanMode; web?: boolean; handoff?: CardHandoffState; /** A squad member of a card conversation (查资料 or 写组件), not a conversation of its own. */ member?: boolean; /** A member's kind and the files it may write (spec §6.3); a 1.2 reading-squad member has none and counts as 查资料. */ squad?: CardSquadAssignment; /** The conversation began with the (possibly overridden) kickoff line. */ kickoff?: boolean; /** The change AI's conversation of this 改动单. */ changeId?: string }
+/** 子代理开关 (spec Q9, §5.4): the most a card conversation may dispatch. */
+export type CardSquadMode = 'off' | 'read' | 'write';
+/** The studio's squad settings (spec §5.4); absent means `{ mode: 'off', selfDispatch: true }`. */
+export interface CardSquadSettings { mode: CardSquadMode; selfDispatch: boolean }
+/** The two built-in card subagents (spec §5.1): 查资料 reads and reports back, 写组件 writes the components it is given. */
+export type CardMemberRole = 'researcher' | 'writer';
+/** A component a 写组件 made with card_new_component (spec §6.3): its name and its files, card-relative. */
+export interface CardMemberComponent { name: string; paths: string[] }
+/**
+ * What a member was sent as (spec §5.2): its kind, the existing component files it may write, the component names it may
+ * create; and what it created, which stays its own to write when it is sent again.
+ */
+export interface CardSquadAssignment { role: CardMemberRole; files: string[]; create: string[]; created?: CardMemberComponent[] }
 
 /** One built-in card studio prompt as developer mode lists it; `stale` means the shipped default changed since the override was saved. */
-export type PromptGroup = 'rules' | 'board' | 'section' | 'kickoff';
+export type PromptGroup = 'rules' | 'board' | 'section' | 'kickoff' | 'squad';
 export interface PromptOverrideItem { id: string; label: string; group: PromptGroup; overridden: boolean; stale: boolean }
 export interface PromptOverrideDetail extends PromptOverrideItem { text: string; defaultText: string }
 
@@ -75,7 +88,7 @@ export type CardSettingsChange = Omit<CardSettings, 'jailbreak'> & { jailbreak?:
 /** 一键制作 covers one board; 全部开做 covers them all and ends with the assembly check; `change` runs one 改动单's dispatches. */
 export type CardRunScope = 'all' | 'lore' | 'script' | 'regex' | 'greet' | 'change';
 export type CardRunStatus = 'running' | 'pausing' | 'paused' | 'stopped' | 'completed';
-export type CardRunPause = 'question' | 'refusal' | 'tool-failures' | 'check-errors' | 'model-error' | 'approval' | 'interjection' | 'user' | 'restart';
+export type CardRunPause = 'question' | 'refusal' | 'tool-failures' | 'check-errors' | 'model-error' | 'approval' | 'interjection' | 'user' | 'restart' | 'incomplete' | 'continue-limit';
 export interface CardRunSettings { thinking: CardThinking; gatewayId: string; modelId?: string; permission: CardPermission; autoAnswer: boolean }
 /**
  * One 一键制作 or 全部开做 run, stored on its card project. `queue` holds the dispatches still to do (the first is the
@@ -88,9 +101,13 @@ export interface CardRun {
   pause?: { reason: CardRunPause; message: string; at: string };
   settings: CardRunSettings;
   queue: string[]; total: number; done: string[];
+  /** The dispatches that were already 进行中 when the run started, left there by a run that was stopped: the run goes on with them in their conversation instead of sending them whole. */
+  pickedUp?: string[];
   current?: { dispatchId: string; taskId: string; stage: 'work' | 'fix'; sent: string[] };
   /** Every message the run sent or acknowledged, per conversation; anything else there is the user writing. */
   sentIds?: Record<string, string[]>;
+  /** 分批写: the dispatch the run carries on with after the section AI said it was not finished, and how many 继续 the run sent for it since the user last pressed 继续 (CONTINUE_LIMIT). */
+  continued?: { dispatchId: string; count: number };
   /** A change of conversation in progress: the old conversation writes its summary before this dispatch. */
   handoff?: { fromTaskId: string; dispatchId: string };
   /** The run's conversation in each section it worked in. */

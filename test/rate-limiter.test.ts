@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { RateLimiter, retryAfterSeconds } from '../src/main/rate-limiter.ts';
+import { RateLimiter } from '../src/main/rate-limiter.ts';
+import { createRateLimitExtension } from '../src/runtime/rate-limit-runtime.ts';
+import { retryAfterSeconds } from '../src/shared/gateway-traffic.ts';
 
 /** A limiter on a clock the test controls, so queueing is exercised without real waiting. */
 function fake() {
@@ -86,4 +88,32 @@ test('Retry-After is read as seconds or as a date', () => {
   assert.equal(retryAfterSeconds({}, now), undefined);
   assert.equal(retryAfterSeconds(undefined, now), undefined);
   assert.equal(retryAfterSeconds({ 'retry-after': 'soon' }, now), undefined);
+});
+
+test('the slot hook waits with the run’s signal, and a refused slot is not an extension failure', async () => {
+  const seen: Array<AbortSignal | undefined> = [];
+  const handlers = new Map<string, (event: unknown, ctx: { signal?: AbortSignal }) => Promise<unknown>>();
+  createRateLimitExtension({ slot: async signal => { seen.push(signal); throw new Error('This request was cancelled while it waited for a rate-limit slot.'); } })(
+    { on: (name: string, handler: (event: unknown, ctx: { signal?: AbortSignal }) => Promise<unknown>) => handlers.set(name, handler) } as never,
+  );
+  const run = new AbortController();
+  await handlers.get('before_provider_request')!({ type: 'before_provider_request', payload: {} }, { signal: run.signal });
+  assert.equal(seen[0], run.signal);
+});
+
+test('a waiting request says why it waits and until when; a request that goes straight out says nothing', async () => {
+  const { limiter, at } = fake();
+  const waits: Array<{ reason: string; until: number }> = [];
+  await limiter.acquire('g', 1);
+  const limited = at();
+  await limiter.acquire('g', 1, undefined, wait => waits.push(wait));
+  assert.deepEqual(waits, [{ reason: 'limit', until: limited + 60_000 }], 'until the first request leaves the rolling window');
+  limiter.cooldown('g', 30);
+  const cooling = at();
+  assert.equal(limiter.cooldownUntil('g'), cooling + 30_000);
+  await limiter.acquire('g', 0, undefined, wait => waits.push(wait));
+  assert.deepEqual(waits.at(-1), { reason: 'cooldown', until: cooling + 30_000 });
+  await limiter.acquire('g', 0, undefined, wait => waits.push(wait));
+  assert.equal(waits.length, 2);
+  assert.equal(limiter.cooldownUntil('never-cooled'), 0);
 });

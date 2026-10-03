@@ -1,6 +1,7 @@
 import type { AppSnapshot, Task, ToolCall } from '../types.ts';
 import { componentName } from './components.ts';
-import { isHandoffRequest } from './markers.ts';
+import { isHandoffRequest, stripMarkers } from './markers.ts';
+import { cardMemberLabel } from './squad.ts';
 import type { ProgressInput } from './progress.ts';
 import type { CardDispatch, CardProjectView } from './types.ts';
 
@@ -55,24 +56,86 @@ export function projectRelativePath(root: string, path: string): string | null {
   return parts.join('/');
 }
 
-export interface TurnWrite { name: string; op: 'write' | 'edit'; paths: string[]; patch?: string; preview?: string }
+export interface TurnWrite { name: string; op: 'write' | 'edit'; paths: string[]; patch?: string; preview?: string; /** Written by a squad member: 「写组件 · 名字」. */ member?: string }
 
-/** 本轮写入: completed write/edit tool calls of one turn inside the card project, grouped by component. */
-export function turnWrites(tools: ToolCall[], turnId: string, root: string): TurnWrite[] {
+/** 本轮写入: completed write/edit tool calls of one turn inside the card project, grouped by component and by who wrote it. */
+export function turnWrites(tools: ReadonlyArray<ToolCall & { memberName?: string }>, turnId: string, root: string): TurnWrite[] {
   const groups = new Map<string, TurnWrite>();
   for (const tool of tools) {
     if (tool.turnId !== turnId || tool.status !== 'completed' || (tool.name !== 'write' && tool.name !== 'edit')) continue;
     const relative = projectRelativePath(root, String(tool.args.path ?? ''));
     if (!relative) continue;
     const name = componentName(relative);
-    const group = groups.get(name) ?? { name, op: tool.name, paths: [] };
+    const key = JSON.stringify([tool.memberName ?? '', name]);
+    const group = groups.get(key) ?? { name, op: tool.name, paths: [], ...(tool.memberName ? { member: tool.memberName } : {}) };
     if (tool.name === 'edit') group.op = 'edit';
     if (!group.paths.includes(relative)) group.paths.push(relative);
     if (tool.patch) group.patch = tool.patch;
     if (tool.name === 'write' && typeof tool.args.content === 'string') group.preview = tool.args.content.split('\n').slice(0, 8).join('\n').slice(0, 600);
-    groups.set(name, group);
+    groups.set(key, group);
   }
   return [...groups.values()];
+}
+
+/** The squad members a card conversation started (spec §6). */
+export function squadOf(tasks: readonly Task[], leadId: string): Task[] {
+  return tasks.filter(task => task.parentId === leadId && !!task.card?.member);
+}
+
+const LATEST = '9999-12-31T23:59:59.999Z';
+/** The lead's turns, each from the moment its message went out until the next one did; members only work inside one. */
+function turnWindows(lead: Pick<Task, 'messages'>): Array<{ id: string; start: string; end: string }> {
+  const sent = lead.messages.filter(message => message.role === 'user' && !message.pending);
+  return sent.map((message, index) => ({ id: message.turnId || message.id, start: message.at, end: sent[index + 1]?.at ?? LATEST }));
+}
+
+/** The lead turn that was running at this moment. */
+export function turnAt(lead: Pick<Task, 'messages'>, at: string): string | undefined {
+  return turnWindows(lead).find(window => window.start <= at && at < window.end)?.id;
+}
+
+/**
+ * The lead turn a member worked for in one of its own turns (spec §6.6): the one that sent it that message, as the app
+ * recorded it, so the work stays with that turn when a later turn is withdrawn or edited; by time for a member from before
+ * the record.
+ */
+function leadTurnOf(windows: ReturnType<typeof turnWindows>, member: Pick<Task, 'messages'>, memberTurnId: string | undefined, at: string): string | undefined {
+  const sent = memberTurnId ? member.messages.find(message => message.role === 'user' && (message.turnId || message.id) === memberTurnId) : undefined;
+  return sent?.leadTurnId ?? windows.find(window => window.start <= at && at < window.end)?.id;
+}
+
+/** The members a turn started, oldest first: that turn's squad area. */
+export function membersOfTurn(lead: Pick<Task, 'messages'>, members: readonly Task[], turnId: string): Task[] {
+  const windows = turnWindows(lead);
+  return members.filter(member => {
+    const first = member.messages.find(message => message.role === 'user');
+    return leadTurnOf(windows, member, first && (first.turnId || first.id), member.createdAt) === turnId;
+  }).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+/** Members' tool calls as part of the lead's turns (spec §6.6): each carries the lead turn it worked for and the member's name. */
+export function squadTools(lead: Pick<Task, 'messages'>, members: readonly Task[], turnIds?: readonly string[]): Array<ToolCall & { memberName: string }> {
+  const windows = turnWindows(lead);
+  return members.flatMap(member => member.tools.flatMap(tool => {
+    const turn = leadTurnOf(windows, member, tool.turnId, tool.at);
+    return turn && (!turnIds || turnIds.includes(turn)) ? [{ ...tool, turnId: turn, memberName: cardMemberLabel(member) }] : [];
+  }));
+}
+
+/** 本轮写入 of one turn of a card conversation: its own writes and its members'. */
+export function leadTurnWrites(lead: Task, tasks: readonly Task[], turnId: string, root: string): TurnWrite[] {
+  return turnWrites([...lead.tools, ...squadTools(lead, squadOf(tasks, lead.id), [turnId])], turnId, root);
+}
+
+/** What a member wrote, by component, for its card in the squad area. */
+export function memberWrites(member: Pick<Task, 'tools'>, root: string): TurnWrite[] {
+  return turnWrites(member.tools.map(tool => ({ ...tool, turnId: 'member' })), 'member', root);
+}
+
+/** What a member handed back, shortened for its card: its last reply, without the markers. */
+export function memberSummary(member: Pick<Task, 'messages'>): string {
+  const text = stripMarkers(member.messages.findLast(message => message.role === 'assistant' && message.text.trim())?.text ?? '').text.trim();
+  return text.length > 400 ? `${text.slice(0, 400)}…` : text;
 }
 
 /**

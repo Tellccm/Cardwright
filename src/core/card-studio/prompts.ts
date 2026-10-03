@@ -2,8 +2,8 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { REQUIRED_TOKENS } from '../../shared/card-studio/assembly-sheet.ts';
 import { boardOf, sectionLabel } from '../../shared/card-studio/boards.ts';
-import { boardPromptFile, sectionPromptFile } from '../../shared/card-studio/prompt-files.ts';
-import type { CardKind, PlanMode } from '../../shared/card-studio/types.ts';
+import { SQUAD_PROMPT_FILES, boardPromptFile, sectionPromptFile } from '../../shared/card-studio/prompt-files.ts';
+import type { CardKind, CardMemberComponent, CardMemberRole, PlanMode } from '../../shared/card-studio/types.ts';
 
 /** Built-in section prompts ship with the application; developer mode can override them (prompt-overrides.ts). */
 export interface SectionPromptInput {
@@ -35,47 +35,65 @@ async function resource(root: string, relative: string): Promise<string> {
   }
 }
 
-/** `read` lets prompt overrides stand in for the shipped files; without it the shipped files are read. */
-export async function buildSectionPrompt(resourceRoot: string, input: SectionPromptInput, options: { read?: (relative: string) => Promise<string> } = {}): Promise<string> {
-  const read = options.read ?? (relative => resource(resourceRoot, relative));
+function cardKindLabel(input: Pick<SectionPromptInput, 'cardKind' | 'source'>): string {
+  return input.cardKind === 'fan' ? `同人卡 · 《${input.source?.trim() || '未填原作名'}》` : '原创卡';
+}
+
+/** The rules a section works by: the common rules, its board's, its own, and for regex sections the card's preset. */
+async function sectionRules(read: (relative: string) => Promise<string>, input: Pick<SectionPromptInput, 'sectionId' | 'mode' | 'stylePreset'>): Promise<string[]> {
   const shared = await read('prompts/通用规则.md');
   const boardFile = boardPromptFile(input.sectionId);
   const board = boardFile ? await read('prompts/' + boardFile) : '';
   const file = sectionPromptFile(input.sectionId, input.mode);
   const own = file ? await read(`prompts/${file}`) : MISSING_SECTION_PROMPT;
-  const kind = input.cardKind === 'fan' ? `同人卡 · 《${input.source?.trim() || '未填原作名'}》` : '原创卡';
+  return [shared, ...(board ? ['', board] : []), '', own, ...(boardOf(input.sectionId).id === 'regex' ? ['', ...presetSection(input.stylePreset ?? null)] : [])];
+}
+
+/** `read` lets prompt overrides stand in for the shipped files; without it the shipped files are read. */
+export async function buildSectionPrompt(resourceRoot: string, input: SectionPromptInput, options: { read?: (relative: string) => Promise<string> } = {}): Promise<string> {
+  const read = options.read ?? (relative => resource(resourceRoot, relative));
   return [
     `# 制卡工坊 · ${sectionLabel(input.sectionId)}`,
     '',
     '## 本次对话',
-    `- 卡项目：${input.cardName}（${kind}）`,
+    `- 卡项目：${input.cardName}（${cardKindLabel(input)}）`,
     `- 卡项目根目录：${input.projectRoot}（只在这里读写文件）`,
     `- 内置资料根目录（只读）：${resourceRoot}`,
     `- 知识库：${join(resourceRoot, 'knowledge', 'README.md')}`,
     '',
-    shared,
-    ...(board ? ['', board] : []),
-    '',
-    own,
-    ...(boardOf(input.sectionId).id === 'regex' ? ['', ...presetSection(input.stylePreset ?? null)] : []),
+    ...(await sectionRules(read, input)),
   ].join('\n');
 }
 
-/** A read-only reader of an Ultra planning squad: reads the material and the design book and reports back to planning. */
-export function buildSquadMemberPrompt(input: Omit<SectionPromptInput, 'sectionId' | 'mode'>): string {
-  const kind = input.cardKind === 'fan' ? `同人卡 · 《${input.source?.trim() || '未填原作名'}》` : '原创卡';
+export interface MemberPromptInput extends SectionPromptInput { role: CardMemberRole; files: readonly string[]; create: readonly string[]; created?: readonly CardMemberComponent[] }
+
+/** A squad member (spec §6.4): its own prompt; a 写组件 then gets the components it was given and the section's rules. */
+export async function buildMemberPrompt(resourceRoot: string, input: MemberPromptInput, options: { read?: (relative: string) => Promise<string> } = {}): Promise<string> {
+  const read = options.read ?? (relative => resource(resourceRoot, relative));
+  const writer = input.role === 'writer';
+  const lines = [
+    `# 制卡工坊 · ${sectionLabel(input.sectionId)} · 小队成员`,
+    '',
+    '## 本次任务',
+    `- 卡项目：${input.cardName}（${cardKindLabel(input)}）`,
+    `- 卡项目根目录：${input.projectRoot}（${writer ? '只写分给你的组件' : '只读'}）`,
+    `- 内置资料根目录（只读）：${resourceRoot}`,
+    `- 知识库：${join(resourceRoot, 'knowledge', 'README.md')}`,
+    '',
+    await read(`prompts/${SQUAD_PROMPT_FILES[input.role]}`),
+  ];
+  if (!writer) return lines.join('\n');
   return [
-    '# 制卡工坊 · 规划小队 · 只读资料员',
+    ...lines,
     '',
-    `- 卡项目：${input.cardName}（${kind}）`,
-    `- 卡项目根目录：${input.projectRoot}（只读）`,
+    '## 分给你的组件',
     '',
-    '你是规划 AI 派出的只读资料员。按分给你的任务读资料和设计书、整理要点，再把结果交回规划 AI，由它汇总后和用户对话。',
+    `- 可以改的已有组件文件：${input.files.length ? input.files.map(path => `\`${path}\``).join('、') : '（没有）'}`,
+    `- 可以用 card_new_component 新建的组件名称：${input.create.length ? input.create.map(name => `「${name}」`).join('、') : '（没有）'}`,
+    // Sent again (spec §6.3): what it created in an earlier run is its own to write.
+    ...(input.created?.length ? [`- 已经新建好的组件（直接改它们的文件）：${input.created.map(item => `「${item.name}」${item.paths.map(path => `\`${path}\``).join('、')}`).join('；')}`] : []),
     '',
-    '- 只读：不写、不改任何文件，不新建组件。',
-    '- 先读 `资料/索引.md`；找人物、事件或说法时先用 `card_search_sources`（搜资料）按关键词或正则搜分章，再精读命中的章节。不要用命令搜资料。',
-    '- 回复只写要点：人物、地点、事件、时间线，每条附原文出处（分章文件与行号）；资料里查不到的写成缺口，不要编造。',
-    '- 用中文。',
+    ...(await sectionRules(read, input)),
   ].join('\n');
 }
 

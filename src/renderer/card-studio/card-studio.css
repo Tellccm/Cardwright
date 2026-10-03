@@ -512,6 +512,7 @@ button.cs-run-current:hover { color: var(--cs-gold-2); }
 .cs-run-queue li { display: grid; grid-template-columns: minmax(96px, 150px) minmax(0, 1fr); gap: 12px; padding: 7px 10px; font-size: 13px; background: #0f1318; }
 .cs-run-queue li span { font-size: 12.5px; color: var(--cs-muted); }
 .cs-run-queue li b { min-width: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cs-run-queue li b small { margin-left: 6px; font-size: 11.5px; font-weight: 400; color: var(--cs-muted); }
 .cs-run-queue li.is-more { display: block; font-size: 12.5px; color: var(--cs-dim); }
 .cs-run-fields { display: grid; gap: 16px; margin-top: 18px; }
 .cs-run-fields select { justify-self: start; min-height: 32px; padding: 4px 10px; font-size: 13px; color: var(--cs-text); background: #0a0d11; border: 1px solid var(--cs-hair-2); border-radius: 0; }

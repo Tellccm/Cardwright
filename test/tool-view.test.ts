@@ -33,3 +33,13 @@ test('a tool call says in one line what it did', () => {
   assert.doesNotMatch(summary, new RegExp(NL));
   assert.equal(toolSummary({ name: 'no_args', args: {} }, t), '');
 });
+
+test('squad tool calls read by what they dispatched, under the new names and the 1.2 ones', () => {
+  const t = (_en: string, zh: string) => zh;
+  assert.equal(toolSummary({ name: 'dispatch_member', args: { role: 'explorer', task: '读一遍 src/runtime，交回要点', title: '查运行时' } }, t), '查运行时');
+  assert.equal(toolSummary({ name: 'dispatch_member', args: { role: 'executor', task: '修好登录页' } }, t), '修好登录页');
+  assert.equal(toolSummary({ name: 'agent', args: { subagent_type: 'Explore', prompt: '旧的任务', description: '旧的标题' } }, t), '旧的标题');
+  assert.equal(toolSummary({ name: 'dispatch_team', args: { members: [{ name: '界面匠', task: 'a' }, { name: '验收员', task: 'b' }] } }, t), '界面匠、验收员');
+  assert.equal(toolSummary({ name: 'agent_team', args: { members: [{ name: '甲队员', prompt: 'a' }, { name: '乙队员', prompt: 'b' }] } }, t), '甲队员、乙队员');
+  assert.equal(toolSummary({ name: 'message_member', args: { member_id: 'm1', message: '再查一下第三章' } }, t), '再查一下第三章');
+});

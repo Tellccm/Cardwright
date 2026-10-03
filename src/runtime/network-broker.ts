@@ -1,8 +1,11 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { watchedFetch, type GatewayWatch } from './gateway-watch.ts';
 
 export interface NetworkPolicy {
   approve: (request: { url: string; method: string }, signal: AbortSignal) => Promise<boolean>;
   origins: () => readonly string[];
+  /** The task's own gateway: its requests are watched for a 429 and, when set, for silence (gateway-watch.ts). */
+  watch?: () => GatewayWatch | undefined;
 }
 
 const policies = new AsyncLocalStorage<NetworkPolicy>();
@@ -55,7 +58,10 @@ export function withNetworkPolicy<T>(policy: NetworkPolicy, action: () => T): T 
     const native = globalThis.fetch.bind(globalThis);
     globalThis.fetch = (input, init) => {
       const active = policies.getStore();
-      return active ? brokeredFetch(native, active, input, init) : native(input, init);
+      if (!active) return native(input, init);
+      // The watch wraps each network hop after the egress decision, so it times and reads only what really went out.
+      const watch = active.watch?.();
+      return brokeredFetch(watch ? watchedFetch(native, watch) : native, active, input, init);
     };
   }
   return policies.run(policy, action);

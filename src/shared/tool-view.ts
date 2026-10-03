@@ -13,9 +13,13 @@ export function foldOutput(text: string, limits: { lines?: number; chars?: numbe
   return { head: text, hiddenLines: 0, folded: false };
 }
 
-/** The one line beside the tool's name: the file, the command, the query, else the arguments. */
+/** The one line beside the tool's name: the file, the command, the query, what a member was sent to do, else the arguments. */
 export function toolSummary(tool: { name: string; args: Record<string, unknown> }, _t: (en: string, zh: string) => string): string {
-  const first = tool.args.query ?? tool.args.path ?? tool.args.command ?? tool.args.description ?? tool.args.prompt;
+  const members = Array.isArray(tool.args.members)
+    ? tool.args.members.map(member => member && typeof member === 'object' ? (member as Record<string, unknown>).name : undefined).filter((name): name is string => typeof name === 'string' && name.trim() !== '').join('、')
+    : '';
+  // dispatch_member says title / task, the 1.2 agent tool said description / prompt; a squad reads as its members' names.
+  const first = tool.args.query ?? tool.args.path ?? tool.args.command ?? tool.args.title ?? tool.args.description ?? tool.args.task ?? tool.args.prompt ?? (members || undefined) ?? tool.args.message;
   const text = typeof first === 'string' && first.trim() ? first : Object.keys(tool.args).length ? JSON.stringify(tool.args) : '';
   return text.replace(/\s+/g, ' ').trim().slice(0, SUMMARY_CHARS);
 }

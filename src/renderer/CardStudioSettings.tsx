@@ -2,21 +2,30 @@ import { useEffect, useState } from 'react';
 import { useApp } from './context';
 import { Row, Toggle } from './primitives';
 import { DEFAULT_HANDOFF, type HandoffSettings } from '../shared/card-studio/handoff';
-import type { PromptGroup, PromptOverrideItem } from '../shared/card-studio/types';
+import { cardSquadSettings } from '../shared/card-studio/squad';
+import type { CardSquadMode, CardSquadSettings, PromptGroup, PromptOverrideItem } from '../shared/card-studio/types';
 import { PromptEditor } from './card-studio/PromptEditor';
 
 const GROUPS: Array<{ id: PromptGroup; en: string; zh: string }> = [
   { id: 'rules', en: 'Common rules', zh: '通用规则' },
   { id: 'board', en: 'Board rules', zh: '板块通用规则' },
   { id: 'section', en: 'Section prompts', zh: '分区提示词' },
+  { id: 'squad', en: 'Squad prompts', zh: '小队提示词' },
   { id: 'kickoff', en: 'Kickoff lines', zh: '开场话' },
 ];
 
-/** 工作室设置 → 制卡: when the app offers a new conversation, and developer mode with prompt overrides (§5.2, §5.6). */
+const SQUAD_MODES: Array<{ id: CardSquadMode; en: string; zh: string }> = [
+  { id: 'off', en: 'Off', zh: '关' }, { id: 'read', en: 'Read only', zh: '只读' }, { id: 'write', en: 'Can write', zh: '可写' },
+];
+
+/** 工作室设置 → 制卡: when the app offers a new conversation, the squad switch, and developer mode with prompt overrides (§5.2, §5.6, §6.1). */
 export function CardStudioSettings() {
   const { data, api, t, run } = useApp();
   const handoff = data.preferences.cardHandoff ?? DEFAULT_HANDOFF;
   const developer = !!data.preferences.developerMode;
+  const squad = cardSquadSettings(data.preferences);
+  const limit = data.studio?.preferences.defaultSquadSize || 6;
+  const saveSquad = (changes: Partial<CardSquadSettings>) => void run(() => api.savePreferences({ cardSquad: { ...squad, ...changes } }));
   const [prompts, setPrompts] = useState<PromptOverrideItem[] | null>(null);
   const [editing, setEditing] = useState<string | null>(null);
   useEffect(() => {
@@ -42,6 +51,16 @@ export function CardStudioSettings() {
     <Row title={t('Share of the model window', '占模型窗口的比例')} description={t('Default 50%. From 10% to 90%.', '默认 50%，可设 10% 到 90%。')}>
       <span className="number-with-unit"><input key={handoff.windowPercent} className="number-input" type="number" min={10} max={90} step={5} defaultValue={handoff.windowPercent} aria-label={t('Share of the model window for a new conversation', '换对话占模型窗口的比例')} onBlur={event => save({ windowPercent: number(event.target.value, handoff.windowPercent) })} />%</span>
     </Row>
+
+    <h3 className="settings-section-title">{t('Squads', '小队')}</h3>
+    <p className="settings-intro">{t('Planning and section AIs can send squad members to work in parallel: 查资料 only reads and reports back, 写组件 writes only the components it is given.', '规划 AI 和分区 AI 可以派小队成员分头做：「查资料」只读，交回要点；「写组件」只写分给它的组件。')}</p>
+    <Row title={t('Sub-agents', '子代理')} description={t('The most a conversation may send. Off: none (an Ultra planning conversation can still send 查资料). Read only: 查资料. Can write: both.', '最多能派哪种成员。关：不派（Ultra 档的规划仍能派「查资料」）；只读：只派「查资料」；可写：两种都能派。')}>
+      <div className="segmented" role="group" aria-label={t('Sub-agents', '子代理')}>{SQUAD_MODES.map(mode => <button key={mode.id} type="button" className={squad.mode === mode.id ? 'active' : ''} aria-pressed={squad.mode === mode.id} onClick={() => { if (squad.mode !== mode.id) saveSquad({ mode: mode.id }); }}>{t(mode.en, mode.zh)}</button>)}</div>
+    </Row>
+    <Row title={t('Self-organised squads', '自行组队')} description={squad.mode === 'off' ? t('Turn the sub-agents on first.', '先打开子代理。') : t('On: the AI decides when to send members, by the built-in rules. Off: only when you ask for it in your message.', '开：AI 按内置标准自己决定什么时候派；关：只在你的消息里明确要求时才派。')}>
+      <Toggle checked={squad.selfDispatch} disabled={squad.mode === 'off'} label={t('Self-organised squads', '自行组队')} onChange={value => saveSquad({ selfDispatch: value })} />
+    </Row>
+    <p className="settings-footnote">{t(`Members use the lead's gateway, model and effort. How many run at once follows “Concurrent agents” (Agent & models); each lead holds at most ${limit} members, set by “Member quota” (Workbench & verification).`, `成员和主 AI 用同一个网关、模型和思考强度。同时跑几个，看「Agent 与模型」里的「同时运行的 Agent」；每个主 AI 最多带 ${limit} 个成员，在「工作台与验证」里的「成员额度」改。`)}</p>
 
     <h3 className="settings-section-title">{t('Developer mode', '开发者模式')}</h3>
     <Row title={t('Show and edit built-in prompts', '查看和修改内置提示词')} description={t('Edits are saved as prompt overrides in your data folder, survive updates and apply to conversations started afterwards. The knowledge base, style presets and the workbench prompt are not editable.', '修改存为提示词覆盖，放在资料目录里，软件更新后仍然生效，对之后新开的对话生效。知识库、风格预设和工作台提示词不在其中。')}>

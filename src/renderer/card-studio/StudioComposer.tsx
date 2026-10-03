@@ -8,9 +8,11 @@ import { EffortSlider } from '../EffortSlider';
 import { JailbreakPicker } from '../JailbreakPicker';
 import { thinkingLabel } from '../effort';
 import { selectedModel } from '../model-resolution';
+import { useNetStatusText } from '../net-status';
 import { playCue } from '../sound';
 import { availableEfforts } from '../../shared/effort';
 import { sectionOf } from '../../shared/card-studio/boards';
+import { cardDispatchRoles, cardSquadSettings } from '../../shared/card-studio/squad';
 import { runningConversation } from '../../shared/card-studio/view';
 import type { CardProjectView } from '../../shared/card-studio/types';
 import type { PermissionMode, Task, ThinkingLevel } from '../../shared/types';
@@ -45,19 +47,29 @@ export function StudioComposer({ card, sectionId, task }: { card: CardProjectVie
   const [sending, setSending] = useState(false);
   const textarea = useRef<HTMLTextAreaElement>(null);
   const root = useRef<HTMLElement>(null);
+  // 排队 / 冷却 / 重试 of this conversation's model request (§5.5), counted down while it lasts.
+  const net = useNetStatusText(task?.net);
   const running = !!task && (ACTIVE.includes(task.status) || !!task.workerActive);
   const other = runningConversation(data.tasks, card.projectId);
   const blocked = !!other && other.id !== task?.id;
   const draftGatewayId = draftModel?.gatewayId ?? (data.gateways.find(item => item.id === data.preferences.defaultGatewayId) ?? data.gateways[0])?.id ?? '';
   const gateway = task ? selectedModel(data.gateways.find(item => item.id === task.gatewayId), task.modelId, task.contextWindow)
     : selectedModel(data.gateways.find(item => item.id === draftGatewayId), draftModel?.modelId ?? (draftGatewayId === data.preferences.defaultGatewayId ? data.preferences.defaultModelId : undefined));
-  // Ultra belongs to planning, where it brings the read-only reading squad.
+  // Ultra belongs to planning, which may then send 查资料 even with the 子代理 switch off (spec §6.1).
   const efforts = gateway ? availableEfforts(gateway).filter(level => level !== 'ultra' || sectionId === 'plan') : ['off' as ThinkingLevel];
   const permission: PermissionMode = task ? task.permission : settings?.permission ?? 'edit';
   const labels = cardPermissionLabels(t);
   const currentThinking = task ? task.thinking : efforts.includes(thinking) ? thinking : efforts.includes('medium') ? 'medium' : efforts[0];
   const webOn = task ? !!task.card?.web : web;
   const high = !!sectionOf(sectionId)?.high || sectionId === 'plan';
+  // 小队 (spec §6.1): what this conversation may send now, by the 子代理 switch, its section and its effort.
+  const squad = cardSquadSettings(data.preferences);
+  const squadRoles = cardDispatchRoles({ settings: squad, sectionId, thinking: currentThinking, member: false });
+  const squadLabel = squadRoles.includes('writer') ? t('Squad · can write', '小队 · 可写') : squadRoles.length ? t('Squad · read only', '小队 · 只读') : t('Squad · off', '小队 · 关');
+  const squadTip = squad.mode !== 'off'
+    ? squad.selfDispatch ? t('Self-organised squads on: the AI decides when to send members.', '自行组队：开，由 AI 自己判断什么时候派。') : t('Self-organised squads off: members go out only when you ask for them in your message.', '自行组队：关，只在你的消息里明确要求时才派。')
+    : squadRoles.length ? t('Sub-agents are off in Studio settings, but Ultra planning still sends 查资料; the AI decides when.', '工作室设置里的「子代理」是关，但规划选 Ultra 时照旧可派「查资料」，由 AI 自己判断什么时候派。')
+      : t('Sub-agents are off in Studio settings, so this conversation sends no squad. Ultra planning still sends 查资料.', '工作室设置里的「子代理」是关，这个对话不派小队；规划选 Ultra 时照旧可派「查资料」。');
 
   useEffect(() => { const element = textarea.current; if (element) { element.style.height = 'auto'; element.style.height = `${Math.min(element.scrollHeight, 260)}px`; } }, [text]);
   useEffect(() => { if (draft) textarea.current?.focus(); }, [draft?.title, draft?.dispatchId]);
@@ -116,6 +128,7 @@ export function StudioComposer({ card, sectionId, task }: { card: CardProjectVie
 
   return <section ref={root} className={`cs-composer ${running ? 'is-running' : ''}`} aria-label={t('Section composer', '分区输入')}>
     {slash.panel && <CommandPanelView panel={slash.panel} task={task} onClose={slash.closePanel} onOpenBuild={slash.openBuild} />}
+    {net && <p className={`cs-composer-note cs-composer-net${task?.net?.state === 'queued' ? '' : ' is-warn'}`}>{net}</p>}
     <div className="cs-composer-box">
       {slash.suggestions.length > 0 && <SlashMenu items={slash.suggestions} active={slash.active} onChoose={slash.choose} />}
       <textarea ref={textarea} rows={3} value={text} disabled={sending} onChange={event => setText(event.target.value)} onKeyDown={keys}
@@ -128,9 +141,7 @@ export function StudioComposer({ card, sectionId, task }: { card: CardProjectVie
           <div className="menu-footnote">{t('Shift+Tab switches. This card remembers the choice.', 'Shift+Tab 切换；这张卡会记住所选的档位。')}</div>
         </>}</Popover>
         <button type="button" className={`cs-chip is-toggle ${webOn ? 'is-on' : ''}`} aria-pressed={webOn} onClick={() => void changeWeb(!webOn)}><Globe size={13} />{webOn ? t('Web · on', '联网 · 开') : t('Web · off', '联网 · 关')}</button>
-        {sectionId === 'plan' && currentThinking === 'ultra'
-          ? <span className="cs-chip is-on" title={t('Ultra planning sends a read-only squad to read the material.', 'Ultra 规划会派只读小队读资料。')}><Users size={13} />{t('Squad · reads', '小队 · 只读读资料')}</span>
-          : <span className="cs-chip is-muted" title={t('Only Ultra planning sends a read-only squad.', '只有规划选 Ultra 时才派只读小队。')}><Users size={13} />{t('Squad · off', '小队 · 关')}</span>}
+        <span className={`cs-chip ${squadRoles.length ? 'is-on' : 'is-muted'}`} title={squadTip}><Users size={13} />{squadLabel}</span>
         <button type="button" className="cs-chip is-toggle" title={t('Skills and commands', '技能与命令')} onClick={() => { setText('/'); textarea.current?.focus(); }}><SquareSlash size={13} />{t('Commands', '命令')}</button>
         <JailbreakPicker value={settings?.jailbreak} disabled={running} onChange={next => void run(() => api.saveCardSettings(card.projectId, { jailbreak: next }))} />
         <Popover label={t('Reasoning effort', '思考强度')} className="cs-chip-menu" trigger={<span className="cs-chip">{t('Effort', '思考')} · {thinkingLabel(currentThinking, t)}<ChevronDown size={12} /></span>}>{() => <div className="effort-slider-card">

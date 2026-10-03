@@ -5,6 +5,7 @@ import { Avatar, useAvatarChanger } from './Avatar';
 import { Row, Toggle } from './primitives';
 import { configureSound, playCue } from './sound';
 import { BUILT_IN_THEMES } from '../shared/themes';
+import { ASSISTANT_NAME } from '../shared/identity';
 
 /**
  * 主题 (Q15, Q20): the three built-in themes and the theme packs in the data folder, as swatches. A theme changes
@@ -84,7 +85,7 @@ function PortraitEditor({ role }: { role: 'user' | 'assistant' }) {
   const changer = useAvatarChanger(role);
   return <div className="avatar-editor">
     <Avatar role={role} size={96} interactive />
-    <div className="avatar-editor-copy"><span className="code-tag" aria-hidden="true">{role === 'user' ? 'PLAYER' : 'AGENT'}</span><strong>{role === 'user' ? t('Your avatar', '用户头像') : t('AI avatar', 'AI 头像')}</strong><small>{role === 'user' ? data.preferences.name || t('You', '你') : 'Cardwright'}</small></div>
+    <div className="avatar-editor-copy"><span className="code-tag" aria-hidden="true">{role === 'user' ? 'PLAYER' : 'AGENT'}</span><strong>{role === 'user' ? t('Your avatar', '用户头像') : t('AI avatar', 'AI 头像')}</strong><small>{role === 'user' ? data.preferences.name || t('You', '你') : ASSISTANT_NAME}</small></div>
     <div className="avatar-editor-actions">
       <button type="button" className="button small" aria-label={role === 'user' ? t('Change user avatar', '更换用户头像') : t('Change AI avatar', '更换 AI 头像')} onClick={changer.change}><Upload size={14} />{t('Change image', '更换图片')}</button>
       <button type="button" className="text-button" aria-label={role === 'user' ? t('Reset user avatar', '恢复默认用户头像') : t('Reset AI avatar', '恢复默认 AI 头像')} disabled={busy || !data.preferences.avatars?.[role]} onClick={() => { setBusy(true); void run(() => api.resetAvatar(role)).finally(() => setBusy(false)); }}><RotateCcw size={12} />{t('Reset', '恢复默认')}</button>
@@ -100,6 +101,15 @@ export function AvatarSettings() {
     <div className="avatar-settings-list"><PortraitEditor role="user" /><PortraitEditor role="assistant" /></div>
     <p className="settings-footnote">{t('Choose a local PNG or JPEG up to 10 MB, then drag and zoom to crop. Images are saved at up to 512 pixels on this computer, and past messages update too.', '支持 10 MB 以内的本地 PNG 或 JPEG，可拖动和缩放裁剪，保存为最大 512 像素并只存于本机，历史消息也会统一更新。')}</p>
   </section>;
+}
+
+/** 小绘的性格 (1.3.0 §4.5): on unless switched off. The name and the honest answer about the model stay either way. */
+export function PersonaSettings() {
+  const { api, data, t, run } = useApp();
+  const prefs = data.preferences;
+  return <Row title={t('小绘’s personality', '小绘的性格')} description={t('With it off she is still 小绘 and still names the model she runs on; she just speaks in a neutral tone.', '关掉后仍叫小绘、仍如实说出所用模型，只是说话变成中性语气。')}>
+    <Toggle label={t('小绘’s personality', '小绘的性格')} checked={prefs.persona !== false} onChange={value => void run(() => api.savePreferences({ persona: value }))} />
+  </Row>;
 }
 
 /** Sound cues are synthesized locally and only play while Cardwright is in the foreground. */

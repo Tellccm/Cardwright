@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
@@ -6,12 +7,13 @@ import { fileURLToPath } from 'node:url';
 import test, { type TestContext } from 'node:test';
 import { Harness } from '../src/main/harness.ts';
 import { CardStudioService } from '../src/main/card-studio.ts';
+import { StudioServices } from '../src/main/studio-services.ts';
 import { Vault, type SecretCodec } from '../src/main/vault.ts';
 import { COVER_STYLES } from '../src/core/card-studio/card-project.ts';
 import { formatDispatch } from '../src/shared/card-studio/dispatch.ts';
 import { KICKOFF, isHandoffRequest } from '../src/shared/card-studio/markers.ts';
 import { parseHandoff } from '../src/shared/card-studio/handoff.ts';
-import { conversationsOf } from '../src/shared/card-studio/view.ts';
+import { conversationsOf, leadTurnWrites } from '../src/shared/card-studio/view.ts';
 import { pngChunks, readCardFromPng, writeCardIntoPng } from '../src/core/card-studio/png.ts';
 import { deflateSync } from 'node:zlib';
 import type { PreviewSegment } from '../src/shared/card-studio/preview.ts';
@@ -50,6 +52,20 @@ const task = (harness: Harness, id: string): Task => { const found = harness.sna
 const card = (harness: Harness) => { const found = harness.snapshot().cardStudio?.cards[0]; assert.ok(found); return found; };
 const settled = (harness: Harness, id: string) => { const value = harness.snapshot().tasks.find(item => item.id === id); return !!value && ['completed', 'failed', 'cancelled'].includes(value.status) && !value.workerActive; };
 const lastReply = (harness: Harness, id: string) => task(harness, id).messages.findLast(message => message.role === 'assistant')?.text ?? '';
+type Outcome = { ok?: boolean; error?: string; result?: unknown };
+/** The fake lead's script (stage 3's fake worker): each step is one request it sends the app, in order. */
+const leadScript = (steps: Array<{ method: string; args: Record<string, unknown> }>) => `script:${JSON.stringify(steps)}`;
+const scriptOutcomes = (harness: Harness, id: string): Outcome[] => JSON.parse(lastReply(harness, id).slice('script:'.length) || '[]');
+/** A card with a design book and one 人设 component, ready for squads. */
+async function squadCard(harness: Harness, studio: CardStudioService, root: string, name: string) {
+  const folder = join(root, name);
+  const { card: { projectId } } = await studio.create({ name, kind: 'original', folder });
+  await writeFile(join(folder, '设计书.md'), '# 设计书\n');
+  await writeFile(join(folder, '世界书', '人设', '120-红孩儿.md'), '<红孩儿>\n</红孩儿>\n');
+  await writeFile(join(folder, '世界书', '人设', '120-红孩儿.json'), '{"uid":120}\n');
+  await studio.reload(projectId);
+  return { projectId, folder };
+}
 
 test('a card project is registered as a card, listed by the card library and reused for its folder', async t => {
   const { root, harness, studio } = await setup(t);
@@ -139,6 +155,130 @@ test('planning replies register dispatches once, sending a dispatch starts it an
   await assert.rejects(studio.markDispatchDone(projectId, 'missing'), /找不到这条派单/);
   const saved = JSON.parse(await readFile(join(folder, '卡项目.json'), 'utf8'));
   assert.deepEqual(saved.dispatches.map((item: { status: string }) => item.status), ['active', 'done']);
+});
+
+// 分批写 (ADR 0024, §5.6): planning registers its dispatches a board at a time instead of in one long last reply.
+test('planning registers dispatches through a tool, item by item, once the design book is written', async t => {
+  const { root, harness, studio } = await setup(t);
+  const folder = join(root, 'batch');
+  const { card: { projectId } } = await studio.create({ name: '分批·登记', kind: 'original', folder });
+  const request = (dispatches: unknown) => `card-request:${JSON.stringify({ action: 'add_dispatches', dispatches })}`;
+  const replies = (id: string) => task(harness, id).messages.filter(message => message.role === 'assistant').length;
+  const result = (id: string) => { const reply = lastReply(harness, id); assert.ok(reply.startsWith('card:'), reply); return JSON.parse(reply.slice('card:'.length)); };
+
+  const plan = await studio.startConversation({ projectId, sectionId: 'plan', mode: 'scratch', prompt: request([{ target: '世界书/叙事规则', title: '写叙事规则', body: '写四条叙事规则。' }]) });
+  await until(() => settled(harness, plan.id), 'the batch before the design book');
+  assert.match(lastReply(harness, plan.id), /card-error:.*设计书/);
+  assert.deepEqual(card(harness).dispatches, []);
+
+  await writeFile(join(folder, '设计书.md'), '# 设计书 · 分批·登记\n');
+  await harness.prompt(plan.id, request([
+    { target: '世界书/叙事规则', title: '写叙事规则', prerequisite: '设计书已确认', body: '写四条叙事规则。' },
+    { target: '世界书 / 人设', title: '写人物模板', body: '量身定做人物模板。' },
+    { target: '世界书/人物', title: '写点什么', body: '正文' },
+    { target: '世界书/人设', title: '写人物模板', body: '同一条又来一次' },
+  ]));
+  await until(() => settled(harness, plan.id) && replies(plan.id) === 2, 'the first batch');
+  const first = result(plan.id);
+  assert.equal(first.added, 2);
+  assert.deepEqual(first.results.map((item: { ok: boolean }) => item.ok), [true, true, false, false]);
+  assert.match(first.results[2].error, /不是能派单的分区/);
+  assert.match(first.results[3].error, /已经有一条叫「写人物模板」的派单/);
+  assert.deepEqual(card(harness).dispatches.map(item => [item.sectionId, item.title, item.requires, item.status, item.sourceTaskId]), [
+    ['lore-rules', '写叙事规则', '设计书已确认', 'todo', plan.id], ['lore-people', '写人物模板', '', 'todo', plan.id]]);
+
+  await harness.prompt(plan.id, request([{ target: '世界书/人设', title: '写人物模板', body: '重复' }, { target: '开场白', title: '写开场白', body: '两条普通开场白。' }]));
+  await until(() => settled(harness, plan.id) && replies(plan.id) === 3, 'the second batch');
+  assert.deepEqual(result(plan.id).results.map((item: { ok: boolean }) => item.ok), [false, true]);
+  assert.deepEqual(card(harness).dispatches.map(item => item.title), ['写叙事规则', '写人物模板', '写开场白'], 'batches keep the order they were registered in');
+
+  await harness.prompt(plan.id, request(Array.from({ length: 13 }, (_, index) => ({ target: '世界书/设定', title: `设定${index + 1}`, body: '正文' }))));
+  await until(() => settled(harness, plan.id) && replies(plan.id) === 4, 'the oversized batch');
+  assert.match(lastReply(harness, plan.id), /card-error:一次登记 1 到 12 条派单/);
+  assert.equal(card(harness).dispatches.length, 3);
+
+  // A section conversation and the change AI's conversation do not register dispatches.
+  const section = await studio.startConversation({ projectId, sectionId: 'lore-rules', prompt: request([{ target: '开场白', title: '再写开场白', body: '正文' }]) });
+  await until(() => settled(harness, section.id), 'a section conversation trying the tool');
+  assert.match(lastReply(harness, section.id), /card-error:只有规划对话/);
+  const { task: change } = await studio.startChange(projectId, { kind: 'request', text: '只是看看' });
+  await until(() => settled(harness, change.id), 'the change AI reply');
+  await harness.prompt(change.id, request([{ target: '开场白', title: '改动 · 开场白', body: '正文' }]));
+  await until(() => settled(harness, change.id) && replies(change.id) === 2, 'the change AI trying the tool');
+  assert.match(lastReply(harness, change.id), /card-error:只有规划对话/);
+  assert.equal(card(harness).dispatches.length, 3);
+});
+
+test('only planning that starts or refines a card is offered card_add_dispatches', async t => {
+  const { root, harness, studio } = await setup(t);
+  const folder = join(root, 'offer');
+  const { card: { projectId } } = await studio.create({ name: '分批·工具', kind: 'original', folder });
+  await writeFile(join(folder, '设计书.md'), '# 设计书\n');
+  const offered = async (id: string) => {
+    await until(() => settled(harness, id) && lastReply(harness, id).startsWith('{'), `init report of ${id}`);
+    return JSON.parse(lastReply(harness, id)).addDispatches;
+  };
+  assert.equal(await offered((await studio.startConversation({ projectId, sectionId: 'plan', mode: 'scratch', prompt: 'inspect-card-init' })).id), true);
+  assert.equal(await offered((await studio.startConversation({ projectId, sectionId: 'plan', mode: 'refine', prompt: 'inspect-card-init' })).id), true);
+  assert.equal(await offered((await studio.startConversation({ projectId, sectionId: 'lore-rules', prompt: 'inspect-card-init' })).id), false);
+  const { task: change } = await studio.startChange(projectId, { kind: 'request', text: '只是看看' });
+  await until(() => settled(harness, change.id), 'the change AI reply');
+  await harness.prompt(change.id, 'inspect-card-init');
+  assert.equal(await offered(change.id), false);
+});
+
+test('two batches registered at the same moment never take the same title', async t => {
+  const { root, harness, studio } = await setup(t);
+  const folder = join(root, 'parallel');
+  const { card: { projectId } } = await studio.create({ name: '分批·并发', kind: 'original', folder });
+  await writeFile(join(folder, '设计书.md'), '# 设计书\n');
+  const plan = await studio.startConversation({ projectId, sectionId: 'plan', mode: 'scratch', kickoff: true });
+  await until(() => settled(harness, plan.id), 'the planning reply');
+  // pi runs the tool calls of one reply side by side, so both requests are in flight together.
+  const batch = { action: 'add_dispatches', dispatches: [{ target: '世界书/设定', title: '设定甲', body: '正文' }, { target: '世界书/设定', title: '设定乙', body: '正文' }] };
+  const answers = await Promise.all([studio.toolRequest(task(harness, plan.id), batch), studio.toolRequest(task(harness, plan.id), batch)]) as Array<{ added: number }>;
+  assert.deepEqual(answers.map(answer => answer.added).sort(), [0, 2], 'one batch took the titles, the other found them taken');
+  assert.deepEqual(card(harness).dispatches.map(item => item.title), ['设定甲', '设定乙']);
+});
+
+// A 派单 block in a reply (the old way, still parsed) and the tool name a dispatch the same way: the section and the title, not the spelling of the target.
+test('a 派单 block in a reply does not register a dispatch the tool already did under another spelling of the target', async t => {
+  const { root, harness, studio } = await setup(t);
+  const folder = join(root, 'spelling');
+  const { card: { projectId } } = await studio.create({ name: '分批·写法', kind: 'original', folder });
+  await writeFile(join(folder, '设计书.md'), '# 设计书\n');
+  const plan = await studio.startConversation({ projectId, sectionId: 'plan', mode: 'scratch', prompt: `card-request:${JSON.stringify({ action: 'add_dispatches', dispatches: [{ target: '开场白', title: '写开场白', body: '两条普通开场白。' }] })}` });
+  await until(() => settled(harness, plan.id) && card(harness).dispatches.length === 1, 'the registered dispatch');
+  const reply = (target: string, title: string) => `登记过了。\n\n${formatDispatch({ target, title, requires: '', body: '两条普通开场白。' })}`;
+  const replies = () => task(harness, plan.id).messages.filter(message => message.role === 'assistant').length;
+  await harness.prompt(plan.id, reply('开场白/开场白', '写开场白'));
+  await until(() => settled(harness, plan.id) && replies() === 2, 'the reply with the block');
+  await new Promise(done => setTimeout(done, 150));
+  assert.deepEqual(card(harness).dispatches.map(item => [item.sectionId, item.title]), [['greet', '写开场白']], 'the same section under another spelling is the same dispatch');
+  await harness.prompt(plan.id, reply('开场白 / 开场白', '再写一遍'));
+  await until(() => card(harness).dispatches.length === 2, 'a block with a new title');
+  assert.deepEqual(card(harness).dispatches.map(item => item.title), ['写开场白', '再写一遍'], 'a new title is a new dispatch');
+});
+
+// One-click making sends the dispatches in the order they were registered, so a registration must not overtake an earlier one.
+test('two registrations in flight together register in the order they were made, whichever finishes reading the card first', async t => {
+  const { root, harness, studio } = await setup(t);
+  const folder = join(root, 'order');
+  const { card: { projectId } } = await studio.create({ name: '分批·顺序', kind: 'original', folder });
+  await writeFile(join(folder, '设计书.md'), '# 设计书\n');
+  const plan = await studio.startConversation({ projectId, sectionId: 'plan', mode: 'scratch', kickoff: true });
+  await until(() => settled(harness, plan.id), 'the planning reply');
+  // The first call's read of the card is slow (a busy disk, say) and the second one's is not.
+  const reload = studio.reload.bind(studio);
+  let reloads = 0;
+  studio.reload = async (id: string) => { if (reloads++ === 0) await new Promise(done => setTimeout(done, 150)); return reload(id); };
+  const request = (target: string, title: string) => ({ action: 'add_dispatches', dispatches: [{ target, title, body: '正文' }] });
+  const answers = await Promise.all([
+    studio.toolRequest(task(harness, plan.id), request('脚本/变量结构', '写变量表')),
+    studio.toolRequest(task(harness, plan.id), request('世界书/变量', '写变量条目')),
+  ]) as Array<{ added: number }>;
+  assert.deepEqual(answers.map(answer => answer.added), [1, 1], 'nothing lost, nothing doubled');
+  assert.deepEqual(card(harness).dispatches.map(item => item.title), ['写变量表', '写变量条目'], 'the call that came first is registered first');
 });
 
 test('撤回 stops the turn in progress, takes the message out, hands its text back and returns its dispatch to 未派', async t => {
@@ -265,6 +405,16 @@ test('the app asks the section AI for a handoff summary and hands it to one new 
   assert.throws(() => harness.savePreferences({ cardHandoff: { tokens: 120_000, windowPercent: 100 } }), /换对话阈值/);
 });
 
+test('the squad settings save only as 关 / 只读 / 可写 with 自行组队 on or off', async t => {
+  const { harness } = await setup(t);
+  assert.equal(harness.snapshot().preferences.cardSquad, undefined, 'absent means off');
+  harness.savePreferences({ cardSquad: { mode: 'write', selfDispatch: false } });
+  assert.deepEqual(harness.snapshot().preferences.cardSquad, { mode: 'write', selfDispatch: false });
+  assert.throws(() => harness.savePreferences({ cardSquad: { mode: 'all' as never, selfDispatch: true } }), /子代理/);
+  assert.throws(() => harness.savePreferences({ cardSquad: { mode: 'read', selfDispatch: 'yes' as never } }), /自行组队/);
+  assert.deepEqual(harness.snapshot().preferences.cardSquad, { mode: 'write', selfDispatch: false }, 'a refused change leaves the saved one');
+});
+
 test('developer mode edits the built-in prompts; new conversations get the override, and restoring brings the default back', async t => {
   const { root, harness, studio } = await setup(t);
   const { card: { projectId } } = await studio.create({ name: '雾港·开发者', kind: 'original', folder: join(root, 'developer') });
@@ -334,11 +484,604 @@ test('only an Ultra planning conversation gets a squad, and its members only rea
   assert.equal(members.length, 2, lastReply(harness, lead.id));
   for (const member of members) {
     assert.equal(member.sharedReadOnly, true);
-    assert.equal(member.role, 'Explore');
-    assert.deepEqual(member.card, { sectionId: 'plan', member: true });
+    assert.equal(member.readOnly, true);
+    assert.deepEqual(member.card, { sectionId: 'plan', member: true, squad: { role: 'researcher', files: [], create: [] }, web: false, mode: 'scratch' });
+    assert.equal(member.role, 'researcher');
     assert.equal(JSON.parse(lastReply(harness, member.id)).readOnly, true);
   }
   assert.ok(!conversationsOf(harness.snapshot().tasks, projectId, 'plan').some(item => item.parentId), 'members are not conversations of the section');
+});
+
+test('with 子代理 on 可写, a section conversation starts 查资料 and 写组件 members on its own gateway, model and effort', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-write');
+  harness.saveCardSettings(projectId, { permission: 'ask' });
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([
+    { method: 'team', args: { members: [
+      { name: '白骨精', role: 'writer', prompt: 'complete', files: ['世界书\\人设\\120-红孩儿.md'], create: ['黄袍怪'] },
+      { name: '土地公', role: '查资料', prompt: 'complete' },
+    ] } },
+    { method: 'wait', args: {} },
+  ]) });
+  await until(() => settled(harness, lead.id), 'the lead collects its squad');
+  assert.equal(scriptOutcomes(harness, lead.id)[0]?.ok, true, lastReply(harness, lead.id));
+  const started = harness.snapshot().tasks.filter(item => item.parentId === lead.id);
+  const writer = started.find(item => item.agentName === '白骨精');
+  const reader = started.find(item => item.agentName === '土地公');
+  assert.ok(writer && reader);
+  assert.deepEqual(writer.card, { sectionId: 'lore-people', member: true, squad: { role: 'writer', files: ['世界书/人设/120-红孩儿.md'], create: ['黄袍怪'] }, web: false });
+  assert.deepEqual(reader.card?.squad, { role: 'researcher', files: [], create: [] });
+  assert.deepEqual([writer.title, reader.title], ['写组件 · 白骨精', '查资料 · 土地公']);
+  assert.deepEqual([writer.role, writer.sharedWorkspace, writer.sharedReadOnly, !!writer.readOnly], ['writer', true, false, false]);
+  assert.deepEqual([reader.role, reader.sharedReadOnly, reader.readOnly], ['researcher', true, true]);
+  const leadTask = task(harness, lead.id);
+  assert.equal(leadTask.permission, 'ask');
+  for (const member of [writer, reader]) {
+    assert.equal(member.permission, 'edit', 'a member never asks, so it runs with auto edit');
+    assert.deepEqual([member.gatewayId, member.modelId, member.thinking, member.cwd], [leadTask.gatewayId, leadTask.modelId, leadTask.thinking, leadTask.cwd]);
+  }
+  assert.ok(!conversationsOf(harness.snapshot().tasks, projectId, 'lore-people').some(item => item.parentId), 'members are not conversations of the section');
+});
+
+test('an unnamed card member is called 资料员N or 写手N', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-names');
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([
+    { method: 'delegate', args: { role: 'researcher', prompt: 'complete' } },
+    { method: 'delegate', args: { role: 'researcher', prompt: 'complete' } },
+    { method: 'delegate', args: { role: 'writer', prompt: 'complete', create: ['黄袍怪'] } },
+    { method: 'wait', args: {} },
+  ]) });
+  await until(() => settled(harness, lead.id), 'three delegated members');
+  assert.deepEqual(harness.snapshot().tasks.filter(item => item.parentId === lead.id).map(item => item.agentName), ['资料员1', '资料员2', '写手1'], lastReply(harness, lead.id));
+});
+
+test('a card conversation is held to the 子代理 switch and to real component files when it starts members', async t => {
+  const { root, harness, studio } = await setup(t);
+  const { projectId } = await squadCard(harness, studio, root, 'squad-refused');
+  const errors = async (steps: Array<{ method: string; args: Record<string, unknown> }>) => {
+    const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript(steps) });
+    await until(() => settled(harness, lead.id), 'the refused dispatches');
+    return scriptOutcomes(harness, lead.id).map(item => item.error ?? 'started');
+  };
+  harness.savePreferences({ cardSquad: { mode: 'read', selfDispatch: true } });
+  const read = await errors([
+    { method: 'delegate', args: { role: 'writer', prompt: 'complete', create: ['黄袍怪'] } },
+    { method: 'delegate', args: { role: 'researcher', prompt: 'complete', files: ['世界书/人设/120-红孩儿.md'] } },
+  ]);
+  assert.match(read[0], /能派的只有：查资料/);
+  assert.match(read[1], /files 和 create 只给「写组件」用/);
+  harness.savePreferences({ cardSquad: { mode: 'write', selfDispatch: true } });
+  const write = await errors([
+    { method: 'delegate', args: { role: 'writer', prompt: 'complete', files: ['设计书.md'] } },
+    { method: 'delegate', args: { role: 'writer', prompt: 'complete', files: ['世界书/人设/999-没有.md'] } },
+    { method: 'delegate', args: { role: 'writer', prompt: 'complete', create: ['人物总览'] } },
+    { method: 'delegate', args: { role: 'writer', prompt: 'complete' } },
+    { method: 'delegate', args: { role: 'executor', prompt: 'complete' } },
+    { method: 'team', args: { members: [{ name: '甲手', role: 'writer', prompt: 'complete', create: ['黄袍怪'] }, { name: '乙手', role: 'writer', prompt: 'complete', create: ['黄袍怪'] }] } },
+  ]);
+  assert.match(write[0], /共享文件/);
+  assert.match(write[1], /卡里没有/);
+  assert.match(write[2], /共享组件/);
+  assert.match(write[3], /要写明它写哪些组件/);
+  assert.match(write[4], /不是工坊能派的成员/);
+  assert.match(write[5], /已经分给了别的成员/);
+  harness.savePreferences({ cardSquad: { mode: 'off', selfDispatch: true } });
+  assert.match((await errors([{ method: 'delegate', args: { role: 'researcher', prompt: 'complete' } }]))[0], /不能派小队成员/);
+  assert.equal(harness.snapshot().tasks.filter(item => item.card?.member).length, 0, 'nobody started');
+  const plain = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: 'complete' });
+  await until(() => settled(harness, plain.id), 'a plain conversation');
+  await assert.rejects(harness.createTask({ projectId, parentId: plain.id, prompt: 'complete', role: 'writer', card: { sectionId: 'lore-people', member: true, squad: { role: 'writer', files: [], create: ['黄袍怪'] } } }), /不能派这种小队成员/);
+});
+
+test('a lead that may dispatch gets the 派发 rules and the card roles; with 自行组队 off it waits to be asked', async t => {
+  const { root, harness, studio } = await setup(t);
+  const { projectId } = await squadCard(harness, studio, root, 'squad-context');
+  const report = async () => {
+    const started = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: 'inspect-card-init' });
+    await until(() => settled(harness, started.id), 'the init report');
+    return JSON.parse(lastReply(harness, started.id));
+  };
+  const off = await report();
+  assert.deepEqual([off.canDelegate, off.roles], [false, []]);
+  assert.doesNotMatch(off.prompt, /## 小队/);
+  harness.savePreferences({ cardSquad: { mode: 'write', selfDispatch: true } });
+  const self = await report();
+  assert.deepEqual([self.canDelegate, self.roles], [true, ['researcher', 'writer']]);
+  assert.match(self.prompt, /## 小队/);
+  assert.match(self.prompt, /3 个以上、彼此不依赖的组件/);
+  assert.doesNotMatch(self.prompt, /自行组队：/);
+  harness.savePreferences({ cardSquad: { mode: 'read', selfDispatch: false } });
+  const asked = await report();
+  assert.deepEqual(asked.roles, ['researcher']);
+  assert.match(asked.prompt, /只有用户在消息里明确要求时才派小队/);
+  assert.doesNotMatch(asked.prompt, /3 个以上/);
+});
+
+test('members run with their own prompt, read-only by kind, auto edit, no MCP and no checkpoint of their own', async t => {
+  const { root, harness, studio } = await setup(t);
+  const services = new StudioServices(join(root, 'data'), harness, resolve('dist/Cardwright.CommandHost.exe'), buffer => buffer);
+  harness.attachStudio(services);
+  harness.saveMcpServer({ id: 'fixture-mcp', name: 'Fixture MCP', enabled: true, transport: 'http', url: 'https://example.invalid/mcp' });
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-runtime');
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([
+    { method: 'team', args: { members: [{ name: '白骨精', role: 'writer', prompt: 'inspect-card-init', create: ['黄袍怪'] }, { name: '土地公', role: 'researcher', prompt: 'inspect-card-init' }] } },
+    { method: 'wait', args: {} },
+  ]) });
+  await until(() => settled(harness, lead.id), 'the lead and its squad');
+  const members = harness.snapshot().tasks.filter(item => item.parentId === lead.id);
+  const reportOf = (name: string) => JSON.parse(lastReply(harness, members.find(item => item.agentName === name)!.id));
+  const writer = reportOf('白骨精');
+  const reader = reportOf('土地公');
+  assert.deepEqual(writer.member, { role: 'writer', files: [], create: ['黄袍怪'] });
+  assert.deepEqual([writer.readOnly, writer.permission, writer.canDelegate, writer.mcpServers, writer.fileCheckpoints], [false, 'edit', false, 0, false]);
+  for (const expected of ['你这次负责写组件', '「黄袍怪」', '## 通用规则', '# 世界书 · 人设']) assert.ok(writer.prompt.includes(expected), expected);
+  assert.deepEqual([reader.readOnly, reader.mcpServers, reader.fileCheckpoints], [true, 0, false]);
+  assert.match(reader.prompt, /你这次负责查资料/);
+  assert.doesNotMatch(reader.prompt, /## 通用规则/);
+  for (const member of members) assert.equal(task(harness, member.id).checkpointIds, undefined, 'the lead’s checkpoint covers the members’ writes');
+  assert.equal(task(harness, lead.id).checkpointIds?.length, 1);
+  await harness.prompt(lead.id, 'inspect-card-init');
+  await until(() => settled(harness, lead.id) && lastReply(harness, lead.id).startsWith('{'), 'the lead’s own report');
+  const own = JSON.parse(lastReply(harness, lead.id));
+  assert.deepEqual([own.mcpServers, own.fileCheckpoints], [1, true]);
+});
+
+test('two 写组件 the model sends at the same moment cannot both take the same component', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-race');
+  // pi runs the tool calls of one reply side by side, so both requests are in flight together.
+  const writer = (name: string, path: string) => ({ method: 'delegate', args: { name, role: 'writer', prompt: 'complete', files: [path], create: ['黄袍怪'] } });
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([
+    { method: 'parallel', args: { requests: [writer('甲手', '世界书/人设/120-红孩儿.md'), writer('乙手', '世界书\\人设\\120-红孩儿.md')] } },
+    { method: 'wait', args: {} },
+  ]) });
+  await until(() => settled(harness, lead.id), 'the lead and its writer');
+  const burst = scriptOutcomes(harness, lead.id)[0]?.result as Outcome[];
+  assert.deepEqual(burst.map(item => item.ok === true).sort(), [false, true], lastReply(harness, lead.id));
+  assert.match(burst.find(item => item.error)?.error ?? '', /已经分给了别的成员/);
+  assert.equal(harness.snapshot().tasks.filter(item => item.parentId === lead.id).length, 1, 'only one writer holds the component');
+});
+
+/** The lead's next turn: one more script, and its outcomes once the turn and its squad are over. */
+async function nextTurn(harness: Harness, leadId: string, steps: Array<{ method: string; args: Record<string, unknown> }>): Promise<Outcome[]> {
+  const replies = () => task(harness, leadId).messages.filter(item => item.role === 'assistant').length;
+  const before = replies();
+  await harness.prompt(leadId, leadScript(steps));
+  await until(() => settled(harness, leadId) && replies() > before && harness.snapshot().tasks.every(item => item.parentId !== leadId || settled(harness, item.id)), 'the lead’s next turn');
+  return scriptOutcomes(harness, leadId);
+}
+
+test('a returned member is sent again only as the 子代理 switch allows now, by the lead or by the app', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-again-switch');
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { name: '白骨精', role: 'writer', prompt: 'complete', create: ['黄袍怪'] } }, { method: 'wait', args: {} }]) });
+  await until(() => settled(harness, lead.id), 'the first turn and its 写组件');
+  const writer = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  harness.savePreferences({ cardSquad: { mode: 'read', selfDispatch: true } });
+  const [again] = await nextTurn(harness, lead.id, [{ method: 'steer_agent', args: { agent_id: writer.id, message: 'complete' } }]);
+  assert.match(again?.error ?? '', /能派的只有：查资料/);
+  await assert.rejects(harness.resumeAgent(writer.id, 'complete'), /能派的只有：查资料/);
+  assert.equal(task(harness, writer.id).messages.filter(item => item.role === 'user').length, 1, 'the 写组件 never ran again');
+});
+
+test('a returned 写组件 is not sent again onto a file a working writer holds, nor onto a component it created that another now holds', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 4, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-again-claims');
+  const path = '世界书/人设/120-红孩儿.md';
+  // 甲手 is given 120-红孩儿, creates 黄袍怪, and returns.
+  const create = leadScript([{ method: 'card', args: { action: 'new_component', board: 'lore', name: '黄袍怪' } }]);
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { name: '甲手', role: 'writer', prompt: create, files: [path], create: ['黄袍怪'] } }, { method: 'wait', args: {} }]) });
+  await until(() => settled(harness, lead.id), 'the first turn and its 写组件');
+  const first = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  const made = first.card?.squad?.created?.[0]?.paths.find(item => item.endsWith('.md'));
+  assert.ok(made, JSON.stringify(first.card?.squad));
+  const user = () => task(harness, first.id).messages.filter(item => item.role === 'user').length;
+  // While 乙手 works on 120-红孩儿, 甲手 cannot come back onto it.
+  const onFile = await nextTurn(harness, lead.id, [{ method: 'delegate', args: { name: '乙手', role: 'writer', prompt: 'hold', files: [path] } }, { method: 'steer_agent', args: { agent_id: first.id, message: 'complete' } }]);
+  assert.equal(onFile[0]?.ok, true, JSON.stringify(onFile));
+  assert.match(onFile[1]?.error ?? '', /「世界书\/人设\/120-红孩儿\.md」已经分给了别的成员/);
+  // Nor while 丙手 works on the 黄袍怪 it created.
+  const onMade = await nextTurn(harness, lead.id, [{ method: 'delegate', args: { name: '丙手', role: 'writer', prompt: 'hold', files: [made] } }, { method: 'steer_agent', args: { agent_id: first.id, message: 'complete' } }]);
+  assert.equal(onMade[0]?.ok, true, JSON.stringify(onMade));
+  assert.match(onMade[1]?.error ?? '', /已经分给了别的成员/);
+  assert.equal(user(), 1, '甲手 never ran again');
+});
+
+test('two returned 写组件 the lead messages at the same moment cannot both come back onto one file', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 4, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-again-race');
+  const path = '世界书/人设/120-红孩儿.md';
+  const writer = (name: string) => [{ method: 'delegate', args: { name, role: 'writer', prompt: 'complete', files: [path] } }, { method: 'wait', args: {} }];
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript(writer('甲手')) });
+  await until(() => settled(harness, lead.id), 'the first 写组件');
+  await nextTurn(harness, lead.id, writer('乙手'));
+  const members = harness.snapshot().tasks.filter(item => item.parentId === lead.id);
+  assert.equal(members.length, 2);
+  // pi runs the tool calls of one reply side by side, so both messages are in flight together.
+  const [burst] = await nextTurn(harness, lead.id, [{ method: 'parallel', args: { requests: members.map(member => ({ method: 'steer_agent', args: { agent_id: member.id, message: 'hold' } })) } }]);
+  const outcomes = burst?.result as Outcome[];
+  assert.deepEqual(outcomes.map(item => item.ok === true).sort(), [false, true], JSON.stringify(outcomes));
+  assert.match(outcomes.find(item => item.error)?.error ?? '', /已经分给了别的成员/);
+});
+
+test('a 写组件 sent again keeps writing the components it created: the app records them and its next run gets them', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-again-made');
+  const create = leadScript([{ method: 'card', args: { action: 'new_component', board: 'lore', name: '黄袍怪' } }]);
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { name: '甲手', role: 'writer', prompt: create, create: ['黄袍怪'] } }, { method: 'wait', args: {} }]) });
+  await until(() => settled(harness, lead.id), 'the first turn and its 写组件');
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  const made = (scriptOutcomes(harness, member.id)[0]?.result ?? {}) as { bodyPath?: string; paramsPath?: string };
+  assert.ok(made.bodyPath && made.paramsPath, lastReply(harness, member.id));
+  const created = [{ name: '黄袍怪', paths: [made.bodyPath, made.paramsPath] }];
+  assert.deepEqual(member.card?.squad?.created, created);
+  await assert.rejects(studio.toolRequest(member, { action: 'new_component', board: 'lore', name: '黄袍怪' }), /已经新建过了/);
+  const [again] = await nextTurn(harness, lead.id, [{ method: 'steer_agent', args: { agent_id: member.id, message: 'inspect-card-init' } }, { method: 'wait', args: {} }]);
+  assert.equal(again?.ok, true, JSON.stringify(again));
+  assert.deepEqual(JSON.parse(lastReply(harness, member.id)).member, { role: 'writer', files: [], create: ['黄袍怪'], created }, 'its next run may write them');
+});
+
+test('a member’s permission, model and effort stay its lead’s: changing them is refused', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-fixed');
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: 'complete' } }, { method: 'wait', args: {} }]) });
+  await until(() => settled(harness, lead.id), 'the lead and its member');
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  for (const changes of [{ permission: 'full' as const }, { thinking: 'high' as const }, { gatewayId: 'fixture' }, { modelId: 'fixture' }, { contextWindow: 4096 }]) assert.throws(() => harness.updateTask(member.id, changes), /小队成员/, JSON.stringify(changes));
+  assert.deepEqual([task(harness, member.id).permission, task(harness, member.id).thinking], ['edit', member.thinking]);
+  harness.updateTask(member.id, { title: '查资料 · 改个名' });
+  assert.equal(task(harness, member.id).title, '查资料 · 改个名', 'its title is still the user’s to change');
+});
+
+test('a 写组件 that asks for the same new component twice at once gets one', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId, folder } = await squadCard(harness, studio, root, 'squad-twice');
+  const make = { method: 'card', args: { action: 'new_component', board: 'lore', name: '黄袍怪' } };
+  // pi runs the tool calls of one reply side by side, so both requests are in flight together.
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'writer', prompt: leadScript([{ method: 'parallel', args: { requests: [make, make] } }]), create: ['黄袍怪'] } }, { method: 'wait', args: {} }]) });
+  await until(() => settled(harness, lead.id), 'the lead and its 写组件');
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  const burst = scriptOutcomes(harness, member.id)[0]?.result as Outcome[];
+  assert.deepEqual(burst.map(item => item.ok === true).sort(), [false, true], JSON.stringify(burst));
+  assert.match(burst.find(item => item.error)?.error ?? '', /正在新建|已经新建过了/);
+  assert.equal((await readdir(join(folder, '世界书', '人设'))).filter(name => name.includes('黄袍怪') && name.endsWith('.md')).length, 1, 'one component');
+});
+
+test('two unnamed members the lead sends at the same moment get different names', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 4, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-names-race');
+  const reader = { method: 'delegate', args: { role: 'researcher', prompt: 'complete' } };
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([
+    { method: 'delegate', args: { role: 'researcher', prompt: 'complete-slow-exit' } }, { method: 'wait', args: {} },
+    // The first one is still winding down in the folder, so the next two are named well before they exist.
+    { method: 'parallel', args: { requests: [reader, reader] } }, { method: 'wait', args: {} },
+  ]) });
+  await until(() => settled(harness, lead.id), 'the lead and its three members');
+  assert.deepEqual(harness.snapshot().tasks.filter(item => item.parentId === lead.id).map(item => item.agentName).sort(), ['资料员1', '资料员2', '资料员3'], lastReply(harness, lead.id));
+});
+
+test('a member never waits on the user: the app refuses its approvals and answers its network requests by the 联网 switch', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-asks');
+  const memberSteps = leadScript([
+    { method: 'approve', args: { toolName: 'write', args: { path: '设计书.md' }, reason: '成员想写设计书' } },
+    { method: 'network', args: { url: 'https://example.com/page', method: 'GET' } },
+  ]);
+  const outcomes = async (web: boolean) => {
+    const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', web, prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: memberSteps } }, { method: 'wait', args: {} }]) });
+    await until(() => settled(harness, lead.id), 'the lead and its member');
+    return scriptOutcomes(harness, harness.snapshot().tasks.find(item => item.parentId === lead.id)!.id).map(item => item.result);
+  };
+  assert.deepEqual(await outcomes(false), [false, false]);
+  assert.deepEqual(await outcomes(true), [false, true]);
+  assert.equal(harness.snapshot().approvals.length, 0, 'no approval ever reached the user');
+});
+
+test('a member cannot put a question to the user either: the app refuses its question requests', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-questions');
+  const memberSteps = leadScript([{ method: 'interaction', args: { type: 'confirm', title: '要继续吗？', body: '成员想问用户' } }]);
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: memberSteps } }, { method: 'wait', args: {} }]) });
+  await until(() => settled(harness, lead.id), 'the lead and its member');
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  assert.match(scriptOutcomes(harness, member.id)[0]?.error ?? '', /不能向用户提问/);
+  assert.equal(harness.snapshot().interactions.length, 0, 'no question ever reached the user');
+});
+
+test('a member’s card tools: reading and checks for all, new components only for a 写组件 and only by the names it was given', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-tools');
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([
+    { method: 'team', args: { members: [{ name: '白骨精', role: 'writer', prompt: 'complete', create: ['黄袍怪'] }, { name: '土地公', role: 'researcher', prompt: 'complete' }] } },
+    { method: 'wait', args: {} },
+  ]) });
+  await until(() => settled(harness, lead.id), 'the squad');
+  const members = harness.snapshot().tasks.filter(item => item.parentId === lead.id);
+  const writer = members.find(item => item.agentName === '白骨精')!;
+  const reader = members.find(item => item.agentName === '土地公')!;
+  await assert.rejects(studio.toolRequest(reader, { action: 'new_component', board: 'lore', name: '黄袍怪' }), /不能用这个制卡工具/);
+  await assert.rejects(studio.toolRequest(writer, { action: 'sync_variables' }), /不能用这个制卡工具/);
+  await assert.rejects(studio.toolRequest(writer, { action: 'add_dispatches', dispatches: [{ target: '开场白', title: '写开场白', body: '正文' }] }), /不能用这个制卡工具/, 'only the top-level planning conversation registers dispatches');
+  await assert.rejects(studio.toolRequest(writer, { action: 'new_component', board: 'lore', name: '奎木狼' }), /不在分给你新建的组件里/);
+  const created = await studio.toolRequest(writer, { action: 'new_component', board: 'lore', name: '黄袍怪' }) as { bodyPath: string };
+  assert.match(created.bodyPath, /^世界书\/人设\/.*黄袍怪\.md$/, 'in the lead’s section');
+  const again = { ...writer, tools: [...writer.tools, { id: 'made', name: 'card_new_component', args: { name: '黄袍怪' }, output: '', status: 'completed' as const, at: new Date().toISOString() }] };
+  await assert.rejects(studio.toolRequest(again, { action: 'new_component', board: 'lore', name: '黄袍怪' }), /已经新建过了/);
+  assert.ok(await studio.toolRequest(reader, { action: 'check' }));
+});
+
+test('turning 联网 on for a conversation reaches its working members', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-web');
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: 'hold' } }, { method: 'wait', args: {} }]) });
+  await until(() => harness.snapshot().tasks.some(item => item.parentId === lead.id && item.tools.length === 1), 'the member at work');
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  assert.equal(member.card?.web, false);
+  studio.setWeb(lead.id, true);
+  assert.equal(task(harness, member.id).card?.web, true);
+  await harness.cancelTask(lead.id);
+  await until(() => settled(harness, lead.id) && settled(harness, member.id), 'the stopped squad');
+});
+
+test('saving the search settings leaves a working member on its conversation’s 联网 switch', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-search');
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', web: true, prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: 'hold' } }, { method: 'wait', args: {} }]) });
+  await until(() => harness.snapshot().tasks.some(item => item.parentId === lead.id && item.tools.length === 1), 'the member at work');
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  // The fake worker writes each search state it is sent into the conversation.
+  const heard = () => task(harness, member.id).messages.filter(item => item.role === 'system' && item.text.startsWith('search:')).map(item => item.text);
+  studio.setWeb(lead.id, false);
+  await until(() => heard().length === 1, 'the member hears that 联网 is off');
+  harness.saveSearch({ enabled: true, provider: 'searxng', baseUrl: 'http://127.0.0.1:9' });
+  await until(() => heard().length === 2, 'the member hears the saved settings');
+  assert.deepEqual(heard(), ['search:false', 'search:false'], 'the global search switch does not turn 联网 back on for a member, which searches without asking');
+  await harness.cancelTask(lead.id);
+  await until(() => settled(harness, lead.id) && settled(harness, member.id), 'the stopped squad');
+});
+
+test('an Ultra planning lead holds at most the 成员额度 of members, as a workbench lead does', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.saveGateway({ id: 'thinker', name: 'Thinker', baseUrl: 'https://example.invalid/v1', modelId: 'deep', protocol: 'openai-completions', reasoning: true, contextWindow: 200000, maxTokens: 8192 }, 'fixture-key-never-a-real-credential');
+  harness.savePreferences({ maxConcurrent: 4 });
+  // The setting belongs to the workbench services; the card lead reads the same one.
+  const workbench = new StudioServices(join(root, 'data'), harness, resolve('dist/Cardwright.CommandHost.exe'), buffer => buffer);
+  harness.attachStudio(workbench);
+  workbench.settings({ defaultSquadSize: 2 });
+  const folder = join(root, 'squad-quota');
+  const { card: { projectId } } = await studio.create({ name: '雾港·额度', kind: 'original', folder });
+  const reader = (name: string) => ({ method: 'delegate', args: { name, prompt: 'hold' } });
+  const lead = await studio.startConversation({ projectId, sectionId: 'plan', thinking: 'ultra', gatewayId: 'thinker', prompt: `script:${JSON.stringify([reader('甲读者'), reader('乙读者'), reader('丙读者')])}` });
+  await until(() => settled(harness, lead.id), 'the planning lead runs its script');
+  const results = JSON.parse(lastReply(harness, lead.id).slice('script:'.length)) as Array<{ ok?: boolean; error?: string }>;
+  assert.deepEqual(results.map(item => item.ok === true), [true, true, false], JSON.stringify(results));
+  assert.match(results[2].error ?? '', /成员额度是 2 人：现在已有 2 位成员在做或排队，再派 1 位就超了/);
+  const members = harness.snapshot().tasks.filter(item => item.parentId === lead.id);
+  assert.equal(members.length, 2, 'nobody over the quota was created');
+  assert.ok(members.every(member => member.readOnly && member.card?.member), 'the members are still read-only card members');
+});
+
+test('a member’s task never starts a dispatch and its reply never registers one: the books follow the lead', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-books');
+  const planner = await studio.startConversation({ projectId, sectionId: 'plan', prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: 'reply-dispatches' } }, { method: 'wait', args: {} }]) });
+  await until(() => settled(harness, planner.id), 'the planning lead and its member');
+  assert.equal(scriptOutcomes(harness, planner.id)[0]?.ok, true, lastReply(harness, planner.id));
+  assert.deepEqual(card(harness).dispatches, [], 'a member’s reply registers nothing');
+  await harness.prompt(planner.id, 'reply-dispatches');
+  await until(() => card(harness).dispatches.length === 2, 'the lead’s own dispatches');
+  const people = card(harness).dispatches.find(item => item.sectionId === 'lore-people')!;
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: formatDispatch(people) } }, { method: 'wait', args: {} }]) });
+  await until(() => settled(harness, lead.id), 'the section lead and its member');
+  assert.equal(card(harness).dispatches.find(item => item.id === people.id)?.status, 'todo', 'a member’s task does not start the dispatch');
+  assert.equal(harness.snapshot().tasks.find(item => item.parentId === lead.id)?.card?.dispatchId, undefined);
+});
+
+test('撤回 stops the lead and returns only once every member has stopped too', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-withdraw');
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: 'linger' } }, { method: 'wait', args: {} }]) });
+  await until(() => harness.snapshot().tasks.some(item => item.parentId === lead.id && item.tools.length === 1), 'the member at work');
+  const message = task(harness, lead.id).messages.find(item => item.role === 'user')!;
+  await studio.withdraw(lead.id, message.id);
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  assert.equal(member.status, 'cancelled');
+  assert.equal(member.workerActive, false, 'so 撤销本轮 can follow at once');
+});
+
+/** A writing squad whose 写组件 is still at work on 120-红孩儿; it writes that file once more while it stops. */
+async function stoppingWriter(t: TestContext, name: string) {
+  const { root, harness, studio } = await setup(t);
+  const services = new StudioServices(join(root, 'data'), harness, resolve('dist/Cardwright.CommandHost.exe'), buffer => buffer);
+  harness.attachStudio(services);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId, folder } = await squadCard(harness, studio, root, name);
+  const path = '世界书/人设/120-红孩儿.md';
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'writer', prompt: `linger:${path}`, files: [path] } }, { method: 'wait', args: {} }]) });
+  await until(() => harness.snapshot().tasks.some(item => item.parentId === lead.id && item.tools.length === 1), 'the 写组件 at work');
+  const turnId = task(harness, lead.id).messages.find(item => item.role === 'user')!.id;
+  /** 撤销本轮 as the studio does it: every file the turn changed goes back, unless it changed again after the turn was sealed. */
+  const undo = async () => {
+    const checkpoint = (await services.checkpoints.list(lead.id)).find(item => item.turnId === turnId)!;
+    const review = await services.checkpointDiff(lead.id, checkpoint.id);
+    assert.deepEqual(review.files.map(file => [file.path, file.note]), [[path, undefined]], 'the member’s last write is part of the sealed turn');
+    for (const file of review.files) await services.reviewAction(lead.id, { checkpointId: checkpoint.id, path: file.path, action: 'revert', expectedHash: file.afterHash });
+  };
+  return { harness, studio, lead, folder, turnId, undo, file: join(folder, '世界书', '人设', '120-红孩儿.md') };
+}
+
+test('after 撤回, 撤销本轮 takes back what a member wrote while it stopped: the turn is sealed once the squad is gone', async t => {
+  const { harness, studio, lead, turnId, undo, file } = await stoppingWriter(t, 'squad-undo');
+  assert.equal((await studio.withdraw(lead.id, turnId)).turnId, turnId);
+  assert.equal(await readFile(file, 'utf8'), '成员停下前写的\n', 'the member’s write landed while it stopped');
+  assert.equal(harness.snapshot().tasks.find(item => item.parentId === lead.id)?.workerActive, false);
+  await undo();
+  assert.equal(await readFile(file, 'utf8'), '<红孩儿>\n</红孩儿>\n');
+});
+
+test('a lead that fails with its squad out is sealed once the squad has stopped, so 撤销本轮 takes the members’ writes back too', async t => {
+  const { harness, lead, undo, file } = await stoppingWriter(t, 'squad-fail');
+  await harness.prompt(lead.id, 'error', 'steer');
+  await until(() => settled(harness, lead.id), 'the failed lead');
+  assert.equal(task(harness, lead.id).status, 'failed');
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  assert.deepEqual([member.status, member.workerActive], ['cancelled', false], 'the lead ends once its squad has');
+  assert.equal(await readFile(file, 'utf8'), '成员停下前写的\n');
+  await undo();
+  assert.equal(await readFile(file, 'utf8'), '<红孩儿>\n</红孩儿>\n');
+});
+
+/** A card harness whose turns take checkpoints and are sealed, as in the app. */
+async function sealedSetup(t: TestContext) {
+  const context = await setup(t);
+  const services = new StudioServices(join(context.root, 'data'), context.harness, resolve('dist/Cardwright.CommandHost.exe'), buffer => buffer);
+  context.harness.attachStudio(services);
+  return { ...context, services };
+}
+
+/** 撤销本轮 as the studio does it (actions.undoTurnWrites): what the turn changed goes back; a file changed after its seal is kept. */
+async function undoTurn(services: StudioServices, taskId: string, turnId: string): Promise<{ reverted: string[]; kept: string[] }> {
+  const checkpoint = (await services.checkpoints.list(taskId)).find(item => item.turnId === turnId);
+  assert.ok(checkpoint, 'the turn has a checkpoint');
+  const review = await services.checkpointDiff(taskId, checkpoint.id);
+  const reverted: string[] = [];
+  const kept: string[] = [];
+  for (const file of review.files) {
+    try { await services.reviewAction(taskId, { checkpointId: checkpoint.id, path: file.path, action: 'revert', expectedHash: file.afterHash }); reverted.push(file.path); }
+    catch (error) { assert.match(String(error), /newer changes/, file.path); kept.push(file.path); }
+  }
+  return { reverted, kept };
+}
+
+test('撤销本轮 of a planning turn keeps the dispatches the app registered after it: the turn is sealed before the books', async t => {
+  const { root, harness, studio, services } = await sealedSetup(t);
+  const { card: { projectId } } = await studio.create({ name: '雾港·撤销规划', kind: 'original', folder: join(root, 'undo-plan') });
+  const plan = await studio.startConversation({ projectId, sectionId: 'plan', prompt: 'reply-dispatches' });
+  await until(() => settled(harness, plan.id) && card(harness).dispatches.length === 2, 'the planning turn and its dispatches');
+  const turnId = task(harness, plan.id).messages.find(item => item.role === 'user')!.id;
+  assert.deepEqual(await undoTurn(services, plan.id, turnId), { reverted: [], kept: ['卡项目.json'] }, 'the registration came after the seal');
+  assert.equal((await studio.reload(projectId)).dispatches.length, 2, 'the dispatches it registered are still there');
+});
+
+// card_add_dispatches writes 卡项目.json during the turn, so the turn's checkpoint holds it: unlike a 派单 block, which the app registers after the seal.
+test('撤销本轮 of a planning turn takes back the dispatches that turn registered through card_add_dispatches', async t => {
+  const { root, harness, studio, services } = await sealedSetup(t);
+  const folder = join(root, 'undo-register');
+  const { card: { projectId } } = await studio.create({ name: '雾港·撤销登记', kind: 'original', folder });
+  await writeFile(join(folder, '设计书.md'), '# 设计书\n');
+  const dispatches = [{ target: '世界书/叙事规则', title: '写叙事规则', body: '写四条叙事规则。' }, { target: '开场白', title: '写开场白', body: '两条普通开场白。' }];
+  const plan = await studio.startConversation({ projectId, sectionId: 'plan', mode: 'scratch', prompt: `card-request:${JSON.stringify({ action: 'add_dispatches', dispatches })}` });
+  await until(() => settled(harness, plan.id) && card(harness).dispatches.length === 2, 'the planning turn and its dispatches');
+  const turnId = task(harness, plan.id).messages.find(item => item.role === 'user')!.id;
+  assert.deepEqual(await undoTurn(services, plan.id, turnId), { reverted: ['卡项目.json'], kept: [] }, 'the registration is part of the turn');
+  assert.deepEqual((await studio.reload(projectId)).dispatches, [], 'the dispatches the turn registered are gone with it');
+});
+
+test('撤销本轮 of a squad turn still takes back what its 写组件 wrote', async t => {
+  const { root, harness, studio, services } = await sealedSetup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId, folder } = await squadCard(harness, studio, root, 'undo-squad');
+  const path = '世界书/人设/120-红孩儿.md';
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'writer', prompt: `put:${path}`, files: [path] } }, { method: 'wait', args: {} }]) });
+  await until(() => settled(harness, lead.id) && harness.snapshot().tasks.some(item => item.parentId === lead.id && settled(harness, item.id)), 'the squad turn');
+  const file = join(folder, '世界书', '人设', '120-红孩儿.md');
+  assert.equal(await readFile(file, 'utf8'), '成员写的\n', 'the 写组件 wrote');
+  const turnId = task(harness, lead.id).messages.find(item => item.role === 'user')!.id;
+  assert.deepEqual(await undoTurn(services, lead.id, turnId), { reverted: [path], kept: [] });
+  assert.equal(await readFile(file, 'utf8'), '<红孩儿>\n</红孩儿>\n');
+});
+
+test('撤销本轮 of a 变量结构 turn keeps the variable files the app generated after it', async t => {
+  const { root, harness, studio, services } = await sealedSetup(t);
+  const folder = join(root, 'undo-vars');
+  const { card: { projectId } } = await studio.create({ name: '变量卡·撤销', kind: 'original', folder });
+  await writeFile(join(folder, '设计书.md'), '# 设计书\n');
+  await writeFile(join(folder, '变量表.yaml'), SAMPLE_TABLE);
+  const before = (await studio.reload(projectId)).updatedAt;
+  const conversation = await studio.startConversation({ projectId, sectionId: 'script-schema', prompt: 'complete' });
+  const initvar = join(folder, '世界书', '变量', '1002-[initvar].md');
+  // The sync's last step marks the card edited.
+  await until(() => settled(harness, conversation.id) && existsSync(initvar) && card(harness).updatedAt !== before, 'the turn and the variable sync after it');
+  const turnId = task(harness, conversation.id).messages.find(item => item.role === 'user')!.id;
+  const { reverted, kept } = await undoTurn(services, conversation.id, turnId);
+  assert.deepEqual(reverted, [], 'the turn itself wrote nothing');
+  assert.ok(kept.includes('世界书/变量/1002-[initvar].md') && kept.includes('卡项目.json'), JSON.stringify(kept));
+  assert.ok(existsSync(initvar), 'the sync result survives');
+});
+
+test('a member’s writes count in the lead turn that sent it, under its name, and leave with that turn when it is withdrawn', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-turns');
+  const writer = (prompt: string) => leadScript([{ method: 'delegate', args: { role: 'writer', prompt, files: ['世界书/人设/120-红孩儿.md'] } }, { method: 'wait', args: {} }]);
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: writer('write:世界书/人设/131-可修.md') });
+  await until(() => settled(harness, lead.id), 'the first turn and its 写组件');
+  const path = card(harness).path;
+  const first = task(harness, lead.id).messages.find(item => item.role === 'user')!.id;
+  const [earlier] = harness.snapshot().tasks.filter(item => item.parentId === lead.id);
+  assert.equal(earlier.messages.find(item => item.role === 'user')?.leadTurnId, first, 'the app records the turn that sent the member');
+  const firstWrites = [{ name: '人设·可修', op: 'write', paths: ['世界书/人设/131-可修.md'], member: '写组件 · 写手1' }];
+  assert.deepEqual(leadTurnWrites(task(harness, lead.id), harness.snapshot().tasks, first, path), firstWrites);
+  // The next turn's 写组件 writes while it stops; 撤回 takes that turn out.
+  await harness.prompt(lead.id, writer('linger:世界书/人设/120-红孩儿.md'));
+  await until(() => harness.snapshot().tasks.some(item => item.parentId === lead.id && item.id !== earlier.id && item.tools.length === 1), 'the next turn’s 写组件 at work');
+  const second = task(harness, lead.id).messages.findLast(item => item.role === 'user')!.id;
+  await studio.withdraw(lead.id, second);
+  assert.ok(harness.snapshot().tasks.some(item => item.parentId === lead.id && item.tools.some(tool => tool.name === 'write' && tool.status === 'completed' && String(tool.args.path).endsWith('120-红孩儿.md'))), 'the withdrawn turn’s member wrote');
+  assert.deepEqual(leadTurnWrites(task(harness, lead.id), harness.snapshot().tasks, first, path), firstWrites, 'its writes leave with the withdrawn turn instead of moving to the turn before');
+});
+
+test('a member stopped while its prompt is being read never starts', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-starting');
+  const context = studio.workerContext.bind(studio);
+  let release!: () => void;
+  const gate = new Promise<void>(done => { release = done; });
+  let reading = false;
+  studio.workerContext = async (item: Task) => { if (item.card?.member) { reading = true; await gate; } return context(item); };
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: 'hold' } }, { method: 'wait', args: {} }]) });
+  await until(() => reading, 'the member’s prompt being read');
+  await harness.cancelTask(lead.id);
+  release();
+  await until(() => settled(harness, lead.id), 'the stopped lead and its squad');
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  assert.deepEqual([member.status, member.workerActive, member.tools.length], ['cancelled', false, 0], 'it never runs without its prompt');
+});
+
+test('a member that never answers the stop does not hold 撤回 past its stop timer', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'read', selfDispatch: true } });
+  const { projectId } = await squadCard(harness, studio, root, 'squad-stuck');
+  // The member's worker takes no stop and says no more, so the app has to stop it the hard way.
+  const lead = await studio.startConversation({ projectId, sectionId: 'lore-people', prompt: leadScript([{ method: 'delegate', args: { role: 'researcher', prompt: 'rate-slots-hung' } }, { method: 'wait', args: {} }]) });
+  await until(() => harness.snapshot().tasks.some(item => item.parentId === lead.id && item.messages.some(message => message.role === 'user' && !message.pending)), 'the member at work');
+  const message = task(harness, lead.id).messages.find(item => item.role === 'user')!;
+  const started = Date.now();
+  await studio.withdraw(lead.id, message.id);
+  assert.ok(Date.now() - started < 12_000, `撤回 took ${Date.now() - started} ms`);
+  const member = harness.snapshot().tasks.find(item => item.parentId === lead.id)!;
+  assert.deepEqual([member.status, member.workerActive], ['cancelled', false]);
+  assert.equal(task(harness, lead.id).workerActive, false);
 });
 
 test('web access can be turned on for one conversation', async t => {
@@ -784,4 +1527,14 @@ test('a 改动单 on a card without a design book says so, and a single componen
   await until(() => card(harness).changes[0]?.status === 'done', 'the direct change');
   assert.deepEqual(card(harness).changes[0].direct, ['正则/创角页.json']);
   assert.deepEqual(card(harness).dispatches, []);
+});
+
+test('a single component a change AI’s 写组件 edited counts as the direct edit too', async t => {
+  const { root, harness, studio } = await setup(t);
+  harness.savePreferences({ maxConcurrent: 3, cardSquad: { mode: 'write', selfDispatch: true } });
+  const { card: { projectId } } = await studio.create({ name: '汽灯·小队改动', kind: 'original', folder: join(root, 'direct-squad') });
+  const { task: started } = await studio.startChange(projectId, { kind: 'request', text: '创角页加一个选项 CHANGE:squad' });
+  await until(() => card(harness).changes[0]?.status === 'done', 'the direct change');
+  assert.deepEqual(card(harness).changes[0].direct, ['正则/创角页.json']);
+  assert.ok(harness.snapshot().tasks.some(item => item.parentId === started.id && item.card?.squad?.role === 'writer'), 'a 写组件 made the edit');
 });

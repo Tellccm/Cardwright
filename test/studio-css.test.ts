@@ -25,6 +25,18 @@ test('the containers of the slash and @ menus never clip them', () => {
   }
 });
 
+// The global field rule, input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), outranks a plain
+// `.variable-table-grid input` and gave the 变量表 editor's text fields its padding and no width: the path column shrank
+// to two characters (1.3.0). The editor's own rule needs the same :not() chain, and its dialog, otherwise the default
+// 620 px .modal that scrolls by the pixel its corner accent sticks out, sets its own width and does not scroll.
+test('the 变量表 editor sizes its own fields and its dialog', () => {
+  const css = readFileSync(join(renderer, 'card-studio', 'card-studio-section.css'), 'utf8');
+  assert.match(css, /\.variable-table-grid input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\):not\(\[type="range"\]\)[^{]*\{[^}]*\bheight:/);
+  const modal = /\.variable-table-modal \{([^}]*)\}/.exec(css)?.[1] ?? '';
+  assert.match(modal, /(?:^|[\s;])width:/);
+  assert.match(modal, /overflow:\s*hidden/);
+});
+
 // 0.9 quieted the workbench (§6.5). The motion layer is shared with the card studio, so it must not keep animating
 // the HUD parts that are gone: those rules only cost paint and mislead the next reader.
 test('the motion layer animates nothing the workbench no longer renders', () => {

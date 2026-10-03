@@ -90,6 +90,22 @@ test('pull validates refetched content and restores only generated skill paths t
   } finally { await f.cleanup(); }
 });
 
+test('a backup carries the 说明 of your own subagents and leaves out the ones read from folders', async () => {
+  const f = await fixture();
+  try {
+    f.snapshot.ecosystem.roles = [
+      { id: 'reviewer', name: 'Reviewer', prompt: 'Review', readOnly: true, description: '审查改动' },
+      { id: 'agent:user:helper', name: 'helper', prompt: 'Help.', readOnly: false, source: 'user', description: '读到的', path: join(f.root, 'home', '.claude', 'agents', 'helper.md') },
+    ];
+    await f.backup.preview('local', f.connection);
+    await f.backup.push(f.connection);
+    const data = JSON.parse(f.getStored()) as BackupData;
+    assert.deepEqual(data.ecosystem.roles.map(role => role.id), ['reviewer']);
+    assert.equal(data.ecosystem.roles[0].description, '审查改动');
+    assert.equal(validateBackupData(data).ecosystem.roles[0].description, '审查改动');
+  } finally { await f.cleanup(); }
+});
+
 test('remote schema rejects credentials, prototype keys and paths before apply', async () => {
   const f = await fixture();
   try {

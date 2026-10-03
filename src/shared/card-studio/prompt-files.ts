@@ -28,3 +28,6 @@ export function sectionPromptIds(sectionId: string, mode?: PlanMode): string[] {
   const board = boardPromptFile(sectionId);
   return [...(own ? [`prompts/${own}`] : []), ...(board ? [`prompts/${board}`] : []), 'prompts/通用规则.md', ...(sectionId === 'plan' && mode !== 'change' ? [`kickoff/${mode === 'refine' ? 'refine' : 'scratch'}`] : [])];
 }
+
+/** The squad prompts (spec §6.4–6.5): a 查资料 member's, a 写组件 member's, and the 派发 rules a lead gets when it may dispatch. */
+export const SQUAD_PROMPT_FILES = { researcher: '小队-查资料.md', writer: '小队-写组件.md', dispatch: '小队-派发.md' } as const;

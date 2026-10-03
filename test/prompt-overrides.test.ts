@@ -69,3 +69,23 @@ test('only known prompts can be written, and not empty', async t => {
   await assert.rejects(overrides.save('prompts/../../escape.md', 'x'), /不能修改/);
   await assert.rejects(overrides.save('prompts/通用规则.md', '   '), /不能为空/);
 });
+
+test('an override saved against the 1.2 planning prompt still wins, and is flagged once 1.3 rewords its first line', async t => {
+  const { resources, overrides } = await setup(t);
+  const path = join(resources, 'prompts', '规划-从零开始制卡.md');
+  const shipped = await readFile(path, 'utf8');
+  assert.ok(shipped.includes('你这次负责制卡工坊的规划。'), 'the 1.3 wording ships');
+  await writeFile(path, shipped.replace('你这次负责制卡工坊的规划。', '你是制卡工坊的规划 AI。'));
+  await overrides.save('prompts/规划-从零开始制卡.md', '我改过的规划提示词。');
+  assert.equal((await overrides.read('prompts/规划-从零开始制卡.md')).stale, false);
+  await writeFile(path, shipped);
+  const item = await overrides.read('prompts/规划-从零开始制卡.md');
+  assert.equal(item.stale, true);
+  assert.equal(await overrides.effective('prompts/规划-从零开始制卡.md'), '我改过的规划提示词。', 'an override is never rewritten');
+});
+
+test('the squad prompts are editable, in a group of their own', async t => {
+  const { overrides } = await setup(t);
+  const squad = (await overrides.list()).filter(item => item.group === 'squad');
+  assert.deepEqual(squad.map(item => [item.id, item.label]).sort(), [['prompts/小队-写组件.md', '小队 · 写组件'], ['prompts/小队-查资料.md', '小队 · 查资料'], ['prompts/小队-派发.md', '小队 · 派发']].sort());
+});

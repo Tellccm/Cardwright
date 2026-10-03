@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import type { Harness } from './harness.ts';
 import type { Project, Task } from '../shared/types.ts';
 import { createCardFolder, readCardFile, writeCardFile, type CardProjectFile } from '../core/card-studio/card-project.ts';
 import { importSources, readSourceManifest, resplitSource, type SourceImportReport, type SourceRecord } from '../core/card-studio/sources.ts';
-import { buildSectionPrompt, buildSquadMemberPrompt } from '../core/card-studio/prompts.ts';
+import { buildMemberPrompt, buildSectionPrompt } from '../core/card-studio/prompts.ts';
+import { SQUAD_PROMPT_FILES } from '../shared/card-studio/prompt-files.ts';
+import type { RoleSummary } from '../shared/agents.ts';
 import { PromptOverrides } from '../core/card-studio/prompt-overrides.ts';
 import { CardRunner } from './card-runner.ts';
 import { LORE_FOLDERS, buildLorebookFromProject, createComponent, importCard, importLorebook, importPiece, moveLoreComponents, pieceFileName, readProject, type FileComponent, type PieceImport, type PieceKind, type ProjectComponents } from '../core/card-studio/components.ts';
@@ -28,14 +30,15 @@ import { renderReply, updateBlocks, type PreviewRegex, type PreviewSegment } fro
 import { readCardFromPng, stripCardFromPng, writeCheckedCardPng } from '../core/card-studio/png.ts';
 import { coverDataUrl, decodeCardImage, decodeCover } from '../core/card-studio/cover.ts';
 import { SECTION_IDS, UNCLASSIFIED_SECTION, sortByDependency } from '../shared/card-studio/boards.ts';
-import { dispatchKey, messageStartsDispatch, parseDispatches } from '../shared/card-studio/dispatch.ts';
-import { projectRelativePath } from '../shared/card-studio/view.ts';
+import { DISPATCH_BATCH_LIMIT, dispatchKey, mayAddDispatches, messageStartsDispatch, parseDispatches, planDispatchBatch, sectionDispatchKey, type DispatchBatchResult } from '../shared/card-studio/dispatch.ts';
+import { projectRelativePath, squadOf, squadTools } from '../shared/card-studio/view.ts';
+import { CARD_ROLES, SHARED_COMPONENT_NAMES, cardDispatchRoles, cardSquadSettings, effectiveSelfDispatch, isComponentFile, sharedCardFile, squadDispatchPrompt } from '../shared/card-studio/squad.ts';
 import { parsePeople } from '../shared/card-studio/design-book.ts';
 import { parseStylePreset } from '../shared/card-studio/style-presets.ts';
 import { KICKOFF, handoffRequestText, isHandoffRequest } from '../shared/card-studio/markers.ts';
 import { formatHandoff, handoffFromReply } from '../shared/card-studio/handoff.ts';
 import { changeQueue, runIsOpen, runOwns, runnableSection } from '../shared/card-studio/run.ts';
-import type { CardChange, CardChangeItem, CardCheckReport, CardComponentResult, CardComponentSummary, CardDispatch, CardExportResult, CardImportPreview, CardImportReport, CardLoreSuggestion, CardMeta, CardPieceSummary, CardPreview, CardPreviewKind, CardPreviewState, CardProjectView, CardRunSettings, CardStudioSnapshot, CardVariableSyncResult, CardVariableTableView, CardVariableTableEdit, CoverSource, NewCardChange, NewCardComponent, NewCardProject, PlanMode, StartCardConversation } from '../shared/card-studio/types.ts';
+import type { CardChange, CardChangeItem, CardCheckReport, CardComponentResult, CardComponentSummary, CardDispatch, CardExportResult, CardImportPreview, CardImportReport, CardLoreSuggestion, CardMeta, CardPieceSummary, CardPreview, CardPreviewKind, CardPreviewState, CardProjectView, CardRunSettings, CardSquadAssignment, CardStudioSnapshot, CardVariableSyncResult, CardVariableTableView, CardVariableTableEdit, CoverSource, NewCardChange, NewCardComponent, NewCardProject, PlanMode, StartCardConversation } from '../shared/card-studio/types.ts';
 
 export type StartConversationInput = StartCardConversation;
 const ACTIVE = new Set(['queued', 'running', 'waiting']);
@@ -67,6 +70,8 @@ function exportStamp(components: ProjectComponents): { version: string; date: st
 export class CardStudioService {
   private views = new Map<string, CardProjectView>();
   private queues = new Map<string, Promise<unknown>>();
+  /** Component names a 写组件 is creating right now, by member (spec §6.3): pi runs one reply's tool calls side by side. */
+  private creating = new Map<string, Set<string>>();
   private frontendResources?: Promise<FrontendResources | null>;
   /** Developer-mode edits of the built-in prompts; they apply to conversations started after the edit. */
   readonly prompts: PromptOverrides;
@@ -141,7 +146,7 @@ export class CardStudioService {
     if (dispatch && dispatch.sectionId !== input.sectionId) throw new Error('这条派单不属于这个分区。');
     const mode = input.sectionId === 'plan' ? input.mode ?? (view.origin === 'import' ? 'refine' : 'scratch') : undefined;
     const title = (input.title?.trim() || (input.kickoff ? mode === 'refine' ? '完善优化卡' : '从零开始制卡' : dispatch?.title) || '新对话').slice(0, 160);
-    // Ultra belongs to planning, where it brings the reading squad; elsewhere it means the highest effort.
+    // Ultra belongs to planning, which may then send 查资料 even with the 子代理 switch off (spec §6.1); elsewhere it means the highest effort.
     const thinking = input.thinking === 'ultra' && input.sectionId !== 'plan' ? 'max' : input.thinking;
     const task = await this.harness.createTask({
       projectId: project.id, title, prompt: input.kickoff ? await this.prompts.effective(`kickoff/${mode ?? 'scratch'}`) : input.prompt, permission: input.permission ?? project.cardSettings?.permission ?? 'edit', isolated: false,
@@ -189,7 +194,8 @@ export class CardStudioService {
   /** Called before a message is sent in a card conversation: sending a dispatch starts it. Returns the dispatch it started. */
   async beforePrompt(task: Task, text: string): Promise<string | undefined> {
     const card = task.card;
-    if (!card) return undefined;
+    // A squad member's task never starts a dispatch: the card's books follow the top-level conversation (spec §6.6).
+    if (!card || card.member) return undefined;
     let started: string | undefined;
     try {
       await this.mutate(task.projectId, file => {
@@ -232,7 +238,8 @@ export class CardStudioService {
   /** Called when a card conversation run ends: planning replies register their dispatches; a change AI's reply is its 影响清单. */
   async afterConversation(task: Task): Promise<void> {
     const card = task.card;
-    if (!card) return;
+    // Dispatches, handoffs, the variable sync and one-click making follow the top-level conversation only (spec §6.6).
+    if (!card || card.member) return;
     if (card.handoff?.status === 'requested') {
       const requestId = card.handoff.requestId ?? task.messages.findLast(message => message.role === 'user' && isHandoffRequest(message.text))?.id;
       const handoff = task.status === 'completed' ? handoffFromReply(task.messages, requestId) : null;
@@ -244,10 +251,11 @@ export class CardStudioService {
       const reply = task.status === 'completed' && card.sectionId === 'plan' ? task.messages.findLast(message => message.role === 'assistant' && message.text.trim())?.text ?? '' : '';
       const parsed = parseDispatches(reply).flatMap(item => 'error' in item ? [] : [item]);
       if (parsed.length) await this.mutate(task.projectId, file => {
-        const keys = new Set(file.dispatches.map(dispatchKey)); const at = stamp(); let changed = false;
+        // The same key the tool registers by: a dispatch the tool already registered is not registered again under another spelling of its target.
+        const keys = new Set(file.dispatches.map(sectionDispatchKey)); const at = stamp(); let changed = false;
         for (const item of parsed) {
-          if (keys.has(dispatchKey(item))) continue;
-          keys.add(dispatchKey(item)); changed = true;
+          if (keys.has(sectionDispatchKey(item))) continue;
+          keys.add(sectionDispatchKey(item)); changed = true;
           file.dispatches.push({ id: randomUUID(), target: item.target, sectionId: item.sectionId, title: item.title, requires: item.requires, body: item.body, status: 'todo', createdAt: at, updatedAt: at, sourceTaskId: task.id });
         }
         return changed;
@@ -453,9 +461,10 @@ export class CardStudioService {
       await this.updateChange(task.projectId, changeId, item => { if (item.status !== 'draft') return false; item.items = items; });
       return;
     }
-    // Only this turn's writes: the worker restarts for every turn, so they are the ones after it started.
+    // Only this turn's writes, its members' included: the worker restarts for every turn, so they are the ones after it started.
     const since = task.startedAt ?? '';
-    const direct = [...new Set(task.tools.filter(tool => tool.status === 'completed' && (tool.name === 'write' || tool.name === 'edit') && tool.at >= since)
+    const squad = squadTools(task, squadOf(this.harness.store.state.tasks, task.id));
+    const direct = [...new Set([...task.tools, ...squad].filter(tool => tool.status === 'completed' && (tool.name === 'write' || tool.name === 'edit') && tool.at >= since)
       .map(tool => projectRelativePath(project.path, String(tool.args.path ?? ''))).filter((path): path is string => !!path))];
     if (direct.length) await this.updateChange(task.projectId, changeId, item => { if (item.status !== 'draft') return false; item.direct = direct; item.status = 'done'; delete item.note; });
     else await this.reload(task.projectId);
@@ -490,12 +499,26 @@ export class CardStudioService {
     return this.harness.store.state.tasks.some(task => task.projectId === projectId && task.card && !task.card.member && ACTIVE.has(task.status));
   }
 
-  async workerContext(task: Task): Promise<{ prompt: string; readRoots: string[] }> {
+  async workerContext(task: Task): Promise<{ prompt: string; readRoots: string[]; member?: CardSquadAssignment; dispatchRoles?: RoleSummary[]; addDispatches?: boolean }> {
     const view = await this.reload(task.projectId);
     if (view.error) throw new Error(view.error);
-    if (task.card!.member) return { prompt: buildSquadMemberPrompt({ cardName: view.name, cardKind: view.kind, source: view.source, projectRoot: view.path }), readRoots: [this.resourceRoot] };
-    const prompt = await buildSectionPrompt(this.resourceRoot, { sectionId: task.card!.sectionId, mode: task.card!.mode, cardName: view.name, cardKind: view.kind, source: view.source, projectRoot: view.path, stylePreset: view.stylePreset }, { read: id => this.prompts.effective(id) });
-    return { prompt, readRoots: [this.resourceRoot] };
+    const card = task.card!;
+    const input = { sectionId: card.sectionId, mode: card.mode, cardName: view.name, cardKind: view.kind, source: view.source, projectRoot: view.path, stylePreset: view.stylePreset };
+    const read = (id: string) => this.prompts.effective(id);
+    // A squad member (spec §6.4): its own prompt; a 写组件 also gets what it was given and the section's rules. A 1.2 reading-squad member counts as 查资料.
+    if (card.member) {
+      const member: CardSquadAssignment = card.squad ?? { role: 'researcher', files: [], create: [] };
+      return { prompt: await buildMemberPrompt(this.resourceRoot, { ...input, ...member }, { read }), readRoots: [this.resourceRoot], member };
+    }
+    const prompt = await buildSectionPrompt(this.resourceRoot, input, { read });
+    // Planning that starts or refines a card registers its dispatches by tool (§5.6, ADR 0024); a member never does, it returned above.
+    const registers = mayAddDispatches(card) ? { addDispatches: true } : {};
+    // A lead that may dispatch (spec §6.1, §6.5) gets the 派发 rules after its section's, in the 自行组队 variant in effect, and the roles it may send.
+    const settings = cardSquadSettings(this.harness.store.state.preferences);
+    const roles = cardDispatchRoles({ settings, sectionId: card.sectionId, thinking: task.thinking, member: false });
+    if (!roles.length) return { prompt, readRoots: [this.resourceRoot], ...registers };
+    const rules = squadDispatchPrompt(await read(`prompts/${SQUAD_PROMPT_FILES.dispatch}`), { selfDispatch: effectiveSelfDispatch(settings) });
+    return { prompt: `${prompt}\n\n${rules}`, readRoots: [this.resourceRoot], dispatchRoles: roles.map(role => CARD_ROLES[role]), ...registers };
   }
 
   async readPrompt(projectId: string, sectionId: string, mode?: PlanMode): Promise<string> {
@@ -603,6 +626,21 @@ export class CardStudioService {
     const project = this.cardProject(projectId);
     const result = await this.exclusive(projectId, () => createComponent(project.path, input));
     await this.reload(projectId);
+    return result;
+  }
+
+  /** `files` of a 写组件 (spec §5.2, §6.3): component files that exist in this card, as card-relative paths; anything else is refused. */
+  async memberFiles(projectId: string, files: readonly string[]): Promise<string[]> {
+    const root = this.cardProject(projectId).path;
+    const result: string[] = [];
+    for (const entry of files) {
+      const relative = projectRelativePath(root, entry);
+      if (relative && sharedCardFile(relative)) throw new Error(`「${relative}」是主 AI 的共享文件，不能分给成员。`);
+      if (!relative || !isComponentFile(relative)) throw new Error(`「${entry}」不是卡里的组件文件。files 只列已有组件文件的相对路径，例如 世界书/人设/120-红孩儿.md。`);
+      const exists = await stat(join(root, ...relative.split('/'))).then(info => info.isFile(), () => false);
+      if (!exists) throw new Error(`卡里没有「${relative}」。要新建的组件写进 create。`);
+      if (!result.includes(relative)) result.push(relative);
+    }
     return result;
   }
 
@@ -840,11 +878,14 @@ export class CardStudioService {
   async toolRequest(task: Task, args: Record<string, unknown>): Promise<unknown> {
     if (!task.card) throw new Error('这不是制卡对话，不能使用制卡工具。');
     const action = String(args.action ?? '');
+    const name = String(args.name ?? '').trim();
+    if (task.card.member) this.checkMemberTool(task, action, name);
     if (action === 'new_component') {
       const board = args.board === 'regex' || args.board === 'script' || args.board === 'greeting' ? args.board : 'lore';
-      return this.newComponent(task.projectId, {
+      const sectionId = task.card.sectionId;
+      const create = () => this.newComponent(task.projectId, {
         board, name: String(args.name ?? ''),
-        ...(args.section ? { section: String(args.section) } : board === 'lore' ? { section: task.card.sectionId } : {}),
+        ...(args.section ? { section: String(args.section) } : board === 'lore' ? { section: sectionId } : {}),
         ...(Array.isArray(args.keys) ? { keys: args.keys.map(String) } : {}),
         ...(args.order !== undefined ? { order: Number(args.order) } : {}),
         ...(args.constant !== undefined ? { constant: args.constant === true } : {}),
@@ -853,6 +894,16 @@ export class CardStudioService {
         ...(args.kind ? { kind: args.kind as 'first' | 'alternate' | 'group' } : {}),
         ...(args.format === 'sheet' ? { format: 'sheet' as const } : {}),
       });
+      const squad = task.card.member ? task.card.squad : undefined;
+      if (squad?.role !== 'writer') return create();
+      // A 写组件's name is held from its request on, so two calls in one reply never both create it, and what it created
+      // stays its own to write when it is sent again (spec §6.3); the harness saves that with the member.
+      const release = this.holdName(task.id, name);
+      try {
+        const result = await create();
+        squad.created = [...(squad.created ?? []), { name, paths: [result.bodyPath, result.paramsPath].filter(Boolean) }];
+        return result;
+      } finally { release(); }
     }
     if (action === 'check') return this.runChecks(task.projectId);
     if (action === 'sync_variables') {
@@ -861,7 +912,54 @@ export class CardStudioService {
       return { sync, check: { ok: check.ok, errors: check.findings.filter(item => item.level === 'error'), warnings: check.findings.filter(item => item.level === 'warning') } };
     }
     if (action === 'search_sources') return searchSources(this.cardProject(task.projectId).path, { query: String(args.query ?? ''), regex: args.regex === true, ...(args.limit !== undefined ? { limit: Number(args.limit) } : {}), ...(args.source ? { source: String(args.source) } : {}) });
+    if (action === 'add_dispatches') return this.addDispatches(task, args.dispatches);
     throw new Error('未知的制卡工具动作：' + (action || '(空)'));
+  }
+
+  /**
+   * card_add_dispatches (§5.6, ADR 0024): planning registers its dispatches a board at a time instead of in one long last
+   * reply. Each item is checked like a 派单 block and refused on its own; the rest go into 卡项目.json in the order given,
+   * under the card's lock, so two batches never take the same title. The lock is taken before anything is awaited, the
+   * design book check included: one-click making sends dispatches in the order they were registered, and calls that
+   * arrive together are registered in the order they arrived, not by whichever one finishes reading the card first.
+   */
+  private async addDispatches(task: Task, items: unknown): Promise<DispatchBatchResult> {
+    if (!mayAddDispatches(task.card)) throw new Error('只有规划对话（从零开始制卡、完善优化卡）能登记派单。');
+    if (!Array.isArray(items) || items.length < 1 || items.length > DISPATCH_BATCH_LIMIT) throw new Error(`一次登记 1 到 ${DISPATCH_BATCH_LIMIT} 条派单。`);
+    let outcome: DispatchBatchResult = { added: 0, results: [] };
+    await this.mutate(task.projectId, file => {
+      const batch = planDispatchBatch(file.dispatches, items);
+      const at = stamp();
+      for (const item of batch.accepted) file.dispatches.push({ id: randomUUID(), target: item.target, sectionId: item.sectionId, title: item.title, requires: item.requires, body: item.body, status: 'todo', createdAt: at, updatedAt: at, sourceTaskId: task.id });
+      outcome = { added: batch.accepted.length, results: batch.results };
+      return batch.accepted.length > 0;
+    }, async () => {
+      const view = await this.reload(task.projectId);
+      if (view.error) throw new Error(view.error);
+      if (!view.design.exists) throw new Error('先把设计书写入 设计书.md，再登记派单。');
+    });
+    return outcome;
+  }
+
+  /** A member reads, searches and checks; a 写组件 also creates the components named for it, once each (spec §6.2–6.3). */
+  private checkMemberTool(task: Task, action: string, name: string): void {
+    const squad = task.card!.squad ?? { role: 'researcher' as const, files: [], create: [] };
+    if (action === 'check' || action === 'search_sources') return;
+    if (action !== 'new_component' || squad.role !== 'writer') throw new Error('小队成员不能用这个制卡工具。');
+    if (SHARED_COMPONENT_NAMES.includes(name)) throw new Error(`「${name}」是主 AI 的共享组件，成员不能新建。`);
+    if (!squad.create.includes(name)) throw new Error(`「${name}」不在分给你新建的组件里。可以新建的：${squad.create.map(item => `「${item}」`).join('、') || '（没有）'}。`);
+    const made = squad.created?.find(item => item.name === name);
+    if (made) throw new Error(`「${name}」已经新建过了，直接写它的文件：${made.paths.map(path => `\`${path}\``).join('、')}。`);
+    if (task.tools.some(tool => tool.name === 'card_new_component' && tool.status === 'completed' && String(tool.args.name ?? '').trim() === name)) throw new Error(`「${name}」已经新建过了，直接写它的文件。`);
+  }
+
+  /** Holds a name a member is creating until the component exists; a second request for it meanwhile is refused. */
+  private holdName(taskId: string, name: string): () => void {
+    const names = this.creating.get(taskId) ?? new Set<string>();
+    if (names.has(name)) throw new Error(`「${name}」正在新建，等它建好再写它的文件。`);
+    names.add(name);
+    this.creating.set(taskId, names);
+    return () => { names.delete(name); if (!names.size && this.creating.get(taskId) === names) this.creating.delete(taskId); };
   }
 
   /** A JSON file, or a PNG card: its payload (ccv3 over chara) plus the image without the payloads. */
@@ -1137,9 +1235,11 @@ export class CardStudioService {
     return next.finally(() => { if (this.queues.get(projectId) === next) this.queues.delete(projectId); });
   }
 
-  private async mutate(projectId: string, change: (file: CardProjectFile) => boolean): Promise<void> {
+  /** `guard` runs inside the lock before the file is read, for a check that must hold at the moment the change lands and must not let a later change overtake this one. */
+  private async mutate(projectId: string, change: (file: CardProjectFile) => boolean, guard?: () => Promise<void>): Promise<void> {
     const project = this.cardProject(projectId);
     await this.exclusive(projectId, async () => {
+      await guard?.();
       const file = await readCardFile(project.path);
       if (!change(file)) return;
       file.updatedAt = stamp();

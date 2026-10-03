@@ -7,26 +7,21 @@ import type { ExtensionFactory } from '@earendil-works/pi-coding-agent';
  * in the main process where every worker meets. This hook is the one place
  * every request passes through, whichever code path started it: a turn, a
  * squad member, a compaction summary or a one-click run.
+ *
+ * A 429 is not read here: the provider SDKs throw on a non-2xx status before
+ * `after_provider_response` runs, so the fetch layer reports it instead
+ * (gateway-watch.ts).
  */
 export function createRateLimitExtension(options: {
   slot: (signal?: AbortSignal) => Promise<void>;
-  cooldown: (seconds: number) => void;
-  notify: (message: string) => void;
 }): ExtensionFactory {
   return pi => {
-    pi.on('before_provider_request', async () => {
-      await options.slot();
-    });
-    pi.on('after_provider_response', event => {
-      if (event.status !== 429) return;
-      const raw = event.headers?.['retry-after'] ?? event.headers?.['Retry-After'];
-      const seconds = Number(raw);
-      const at = raw ? Date.parse(raw) : NaN;
-      const wait = Number.isFinite(seconds) && seconds >= 0 ? seconds
-        : Number.isFinite(at) ? Math.max(0, Math.round((at - Date.now()) / 1000))
-        : 20;
-      options.cooldown(wait);
-      options.notify(`服务器说请求太多了（429）。这个网关暂停 ${Math.max(1, Math.round(wait))} 秒后继续。`);
+    pi.on('before_provider_request', async (_event, ctx) => {
+      // The wait follows the run, so a stopped run leaves the queue at once. The desktop process refuses or gives up
+      // a slot only while the task is stopping; the request that follows is aborted with the run, so nothing goes out
+      // and there is no extension failure to report.
+      try { await options.slot(ctx.signal); }
+      catch { /* the task is stopping */ }
     });
   };
 }

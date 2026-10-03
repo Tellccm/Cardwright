@@ -11,6 +11,7 @@ import { readPreset } from '../shared/jailbreak.ts';
 import { setEcosystemApplicationRoot } from '../runtime/ecosystem-skills.ts';
 import type { AppSnapshot, Approval, Bridge, Task } from '../shared/types.ts';
 import type { CardPreviewKind } from '../shared/card-studio/types.ts';
+import { isCardMember } from '../shared/card-studio/squad.ts';
 import { applyAppUpdate, createAppUpdate } from '../shared/app-updates.ts';
 import { shouldNotify, type NotifyKind } from '../shared/notify.ts';
 import { StudioServices } from './studio-services.ts';
@@ -118,8 +119,8 @@ async function initialize(): Promise<void> {
     return { ...publication, publicationRevision };
   };
   service.on('change', publish);
-  // A one-click making run tells the user itself when it pauses or finishes; its conversations do not notify each turn.
-  service.on('finished', (task: Task) => { if (!cardStudio.runner.owns(task.id)) notify(task.truncation ? 'Output limit reached / 输出被截断' : task.status === 'failed' ? 'Task needs attention' : 'Task finished', task.title, task, 'finished'); });
+  // A one-click making run tells the user itself when it pauses or finishes, and a squad member's lead speaks for it.
+  service.on('finished', (task: Task) => { if (!isCardMember(task) && !cardStudio.runner.owns(task.id)) notify(task.truncation ? 'Output limit reached / 输出被截断' : task.status === 'failed' ? 'Task needs attention' : 'Task finished', task.title, task, 'finished'); });
   service.on('approval', (approval: Approval) => { if (!cardStudio.runner.owns(approval.taskId)) notify('Approval requested', 'A task is waiting for permission to use a tool.', undefined, 'approval'); });
   cardStudio.runner.on('notify', ({ title, body }: { title: string; body: string }) => notify(title, body));
   service.on('missed', schedule => notify('Schedule needs attention', schedule.name));

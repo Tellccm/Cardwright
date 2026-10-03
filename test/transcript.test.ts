@@ -64,3 +64,11 @@ test('the suggested file name is one Windows accepts', () => {
   assert.ok(!/[\\/:*?"<>|]/.test(transcriptFileName('a:b*c?d"e<f>g|h/i\\j', at).replace('.md', '')));
   assert.ok(transcriptFileName('x'.repeat(200), at).length < 80);
 });
+
+test('replies are signed by 小绘, a member by its own name, a card conversation with its section', () => {
+  const markdown = buildTranscript(task);
+  assert.match(markdown, /### 小绘/);
+  assert.doesNotMatch(markdown, /### Cardwright/);
+  assert.match(buildTranscript({ ...task, agentName: '探索员1' } as Task), /### 探索员1/);
+  assert.match(buildTranscript({ ...task, card: { sectionId: 'lore-people' } } as Task), /### 小绘 · 世界书 · 人设/);
+});

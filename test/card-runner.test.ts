@@ -8,6 +8,8 @@ import { Harness } from '../src/main/harness.ts';
 import { CardStudioService } from '../src/main/card-studio.ts';
 import { Vault, type SecretCodec } from '../src/main/vault.ts';
 import type { CardRun, CardRunSettings } from '../src/shared/card-studio/types.ts';
+import { CONTINUE_LIMIT, CONTINUE_TEXT } from '../src/shared/card-studio/run.ts';
+import { formatDispatch } from '../src/shared/card-studio/dispatch.ts';
 import type { Gateway, Task } from '../src/shared/types.ts';
 
 const fakeWorker = fileURLToPath(new URL('./fixtures/fake-worker.mjs', import.meta.url));
@@ -107,6 +109,39 @@ test('a question pauses the run; with 自动按推荐 it answers and carries on,
   assert.match(run(harness, auto.projectId)!.autoAnswered[0].text, /称呼用哪个/);
 });
 
+// 自动按推荐 answers a question for the user; a section AI that never stops asking would be answered for ever, request after request.
+test('自动按推荐 stops answering a dispatch after CONTINUE_LIMIT answers and pauses for the user', async t => {
+  const { root, harness, studio, notices } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·问个没完', [['世界书/人设', '写甲', 'RUN:ask forever'], ['世界书/人设', '写乙', 'RUN:deliver 乙']]);
+  await studio.runner.start(projectId, 'lore', { ...settings, autoAnswer: true });
+  await until(() => ['paused', 'completed'].includes(status(harness, projectId) ?? ''), 'the run to stop on its own', 90_000);
+  const paused = run(harness, projectId)!;
+  assert.equal(paused.status, 'paused');
+  assert.equal(paused.pause?.reason, 'question');
+  assert.match(paused.pause?.message ?? '', new RegExp(`自动按推荐答了 ${CONTINUE_LIMIT} 次`));
+  assert.match(paused.pause?.message ?? '', /称呼用哪个/, 'the pending question is in the message');
+  assert.equal(paused.autoAnswered.length, CONTINUE_LIMIT);
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'active', 'not marked done');
+  const answers = task(harness, paused.current!.taskId).messages.filter(message => message.role === 'user' && message.text === '全部按推荐');
+  assert.equal(answers.length, CONTINUE_LIMIT, 'it sent exactly that many');
+  assert.ok(notices.some(notice => /暂停/.test(notice.title)), JSON.stringify(notices));
+  await studio.runner.stop(projectId);
+});
+
+test('自动按推荐 answers the question tool the same way, up to CONTINUE_LIMIT times for one dispatch', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·工具问个没完', [['世界书/人设', '写甲', 'RUN:interact forever']]);
+  await studio.runner.start(projectId, 'lore', { ...settings, autoAnswer: true });
+  await until(() => status(harness, projectId) === 'paused', 'the run to stop on its own', 30_000);
+  const paused = run(harness, projectId)!;
+  assert.equal(paused.pause?.reason, 'question');
+  assert.match(paused.pause?.message ?? '', new RegExp(`自动按推荐答了 ${CONTINUE_LIMIT} 次`));
+  assert.match(paused.pause?.message ?? '', /称呼用大王可以吗/);
+  assert.equal(paused.autoAnswered.length, CONTINUE_LIMIT);
+  assert.equal(harness.snapshot().interactions.length, 1, 'the next question waits for the user');
+  await studio.runner.stop(projectId);
+});
+
 // Only messages of the dispatch in hand count; the turns of earlier dispatches in the same conversation are not news.
 test('继续 on a later dispatch of the same conversation still does what the pause waited for', async t => {
   const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
@@ -146,6 +181,19 @@ test('继续 after a model error asks the same conversation to go on with the di
   assert.equal(dispatchStatus(harness, projectId, 'd1'), 'done');
 });
 
+test('a reply that names gaps the squad left pauses the run; 继续 asks the section to go on', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·缺口', [['世界书/人设', '写甲乙', 'RUN:incomplete']]);
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => status(harness, projectId) === 'paused', 'the incomplete pause');
+  assert.equal(run(harness, projectId)?.pause?.reason, 'incomplete');
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'active', 'not marked done');
+  const conversation = run(harness, projectId)!.current!.taskId;
+  await studio.runner.resume(projectId);
+  await until(() => status(harness, projectId) === 'completed', 'the run after 继续');
+  assert.ok(task(harness, conversation).messages.some(message => message.role === 'user' && /继续做这条派单/.test(message.text)));
+});
+
 test('an approval pauses the run at once; after the user allows it, 继续 carries on', async t => {
   const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
   const { projectId } = await card(harness, studio, root, '一键·批准', [['世界书/人设', '写甲', 'RUN:approve']]);
@@ -176,6 +224,101 @@ test('check errors on this dispatch get one fix round; if they remain the run pa
   assert.match(run(harness, projectId)?.pause?.message ?? '', /130-坏条目/);
   const conversation = task(harness, run(harness, projectId)!.current!.taskId);
   assert.equal(conversation.messages.filter(message => message.role === 'user' && message.text.startsWith('【拼装检查】')).length, 2, 'one fix round for each dispatch');
+});
+
+// 分批写 (ADR 0024): a dispatch that writes a list one item per round is not done after its first round.
+test('a dispatch that is not finished goes on in the same conversation until the section AI says it is', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·接着做', [['世界书/人设', '逐个写人物', 'RUN:continue 2'], ['世界书/人设', '写乙', 'RUN:deliver 乙']]);
+  const continues = () => { const id = run(harness, projectId)?.conversations['lore-people']; return id ? task(harness, id).messages.filter(message => message.role === 'user' && message.text === CONTINUE_TEXT).length : 0; };
+  const marked: Array<[string, number]> = [];
+  const mark = studio.markDispatchDone.bind(studio);
+  studio.markDispatchDone = async (id: string, dispatchId: string) => { marked.push([dispatchId, continues()]); return mark(id, dispatchId); };
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => ['paused', 'completed'].includes(status(harness, projectId) ?? ''), 'the run to stop on its own', 30_000);
+  assert.deepEqual(marked, [['d1', 2], ['d2', 2]], 'the first dispatch was marked done only after its two extra rounds');
+  const finished = run(harness, projectId)!;
+  assert.equal(finished.status, 'completed');
+  assert.deepEqual(finished.done, ['d1', 'd2']);
+  assert.equal(finished.continued, undefined, 'the count goes with the finished dispatch');
+  const sent = task(harness, finished.conversations['lore-people']).messages.filter(message => message.role === 'user').map(message => message.text);
+  assert.ok(sent.findIndex(text => text.includes('RUN:deliver 乙')) > sent.lastIndexOf(CONTINUE_TEXT), 'the next dispatch waits until the first is finished');
+});
+
+test('a dispatch that never says it is finished pauses after CONTINUE_LIMIT rounds; 继续 gives it more', async t => {
+  const { root, harness, studio, notices } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·停不下', [['世界书/人设', '逐个写人物', 'RUN:continue forever']]);
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => ['paused', 'completed'].includes(status(harness, projectId) ?? ''), 'the run to stop on its own', 90_000);
+  const paused = run(harness, projectId)!;
+  assert.equal(paused.pause?.reason, 'continue-limit');
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'active', 'the dispatch is not marked done');
+  assert.deepEqual(paused.continued, { dispatchId: 'd1', count: CONTINUE_LIMIT });
+  assert.ok(notices.some(notice => notice.title.includes(String(CONTINUE_LIMIT))), JSON.stringify(notices));
+  const conversation = paused.current!.taskId;
+  const continues = () => task(harness, conversation).messages.filter(message => message.role === 'user' && message.text === CONTINUE_TEXT).length;
+  assert.equal(continues(), CONTINUE_LIMIT);
+  await studio.runner.resume(projectId);
+  await until(() => continues() === CONTINUE_LIMIT + 1, 'one more round after 继续');
+  assert.equal(run(harness, projectId)?.continued?.count, 1, '继续 starts the count again');
+  await studio.runner.stop(projectId);
+});
+
+// The user can press 【标记完成】 while a run waits on a dispatch; 继续 then has nothing left to carry on.
+test('a dispatch the user marked done during a pause is finished, and the run moves on instead of carrying it on', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·暂停时标完成', [['世界书/人设', '逐个写人物', 'RUN:continue forever'], ['世界书/人设', '写乙', 'RUN:deliver 乙']]);
+  const d1 = harness.snapshot().cardStudio!.cards.find(item => item.projectId === projectId)!.dispatches[0];
+  // The dispatch's first round, which says it is not finished, as the run would have sent it; then the run stops on CONTINUE_LIMIT.
+  const conversation = await studio.startConversation({ projectId, sectionId: 'lore-people', dispatchId: d1.id, title: d1.title, prompt: formatDispatch(d1) });
+  await until(() => settled(harness, conversation.id), 'the first round of the dispatch');
+  const sentIds = task(harness, conversation.id).messages.filter(message => message.role === 'user').map(message => message.id);
+  const at = new Date().toISOString();
+  harness.saveCardRun(projectId, { id: 'fixture-run', scope: 'lore', status: 'paused', pause: { reason: 'continue-limit', message: '为了不一直自动接着做下去，先停在这里。', at }, settings, queue: ['d1', 'd2'], total: 2, done: [], current: { dispatchId: 'd1', taskId: conversation.id, stage: 'work', sent: sentIds }, conversations: { 'lore-people': conversation.id }, sentIds: { [conversation.id]: sentIds }, continued: { dispatchId: 'd1', count: CONTINUE_LIMIT }, autoAnswered: [], startedAt: at, updatedAt: at });
+  await studio.markDispatchDone(projectId, 'd1');
+  const continues = () => task(harness, conversation.id).messages.filter(message => message.role === 'user' && message.text === CONTINUE_TEXT).length;
+  await studio.runner.resume(projectId);
+  await until(() => status(harness, projectId) === 'completed' || continues() > 0, 'the run after 继续');
+  assert.equal(continues(), 0, 'nothing was sent to carry on a dispatch that is done');
+  assert.equal(status(harness, projectId), 'completed');
+  assert.deepEqual(run(harness, projectId)?.done, ['d1', 'd2']);
+  assert.equal(run(harness, projectId)?.continued, undefined, 'the count goes with the finished dispatch');
+  assert.ok(task(harness, conversation.id).messages.some(message => message.role === 'user' && message.text.includes('RUN:deliver 乙')), 'the next dispatch went out in the same conversation');
+  assert.equal(dispatchStatus(harness, projectId, 'd2'), 'done');
+});
+
+test('check errors in a round that goes on get their fix round first; a later round gets its own', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId, folder } = await card(harness, studio, root, '一键·接着修', [['世界书/人设', '逐个写人物', 'RUN:continue 2 errors']]);
+  await mkdir(join(folder, '世界书', '人设'), { recursive: true });
+  await writeFile(join(folder, '世界书', '人设', '131-可修.json'), JSON.stringify({ uid: 131, comment: '可修' }));
+  await writeFile(join(folder, '世界书', '人设', '132-再修.json'), JSON.stringify({ uid: 132, comment: '再修' }));
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => ['paused', 'completed'].includes(status(harness, projectId) ?? ''), 'the run to stop on its own', 30_000);
+  assert.equal(run(harness, projectId)?.pause?.reason, 'check-errors');
+  assert.match(run(harness, projectId)?.pause?.message ?? '', /132-再修/);
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'active');
+  const sent = task(harness, run(harness, projectId)!.current!.taskId).messages.filter(message => message.role === 'user').map(message => message.text);
+  const fixes = sent.flatMap((text, index) => text.startsWith('【拼装检查】') ? [index] : []);
+  assert.equal(fixes.length, 2, 'the round after a fix round that went on got a fix round of its own');
+  assert.equal(sent.filter(text => text === CONTINUE_TEXT).length, 1);
+  assert.ok(fixes[0] < sent.indexOf(CONTINUE_TEXT), 'errors are fixed before the dispatch goes on');
+});
+
+test('check errors on a component a squad member wrote hold the dispatch back as well', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  harness.savePreferences({ cardSquad: { mode: 'write', selfDispatch: true } });
+  // The section AI sends a 写组件, which writes 130-坏条目; the section AI itself writes nothing.
+  const { projectId, folder } = await card(harness, studio, root, '一键·小队检查', [['世界书/人设', '坏条目', 'RUN:squad-broken']]);
+  await mkdir(join(folder, '世界书', '人设'), { recursive: true });
+  await writeFile(join(folder, '世界书', '人设', '130-坏条目.json'), JSON.stringify({ uid: 130, comment: '坏条目' }));
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => status(harness, projectId) === 'paused', 'the check-errors pause');
+  assert.equal(run(harness, projectId)?.pause?.reason, 'check-errors');
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'active', 'not marked done');
+  const conversation = task(harness, run(harness, projectId)!.current!.taskId);
+  assert.ok(harness.snapshot().tasks.some(item => item.parentId === conversation.id && item.card?.squad?.role === 'writer'), 'a 写组件 did the writing');
+  assert.equal(conversation.messages.filter(message => message.role === 'user' && message.text.startsWith('【拼装检查】')).length, 1, 'the member’s component got the fix round');
 });
 
 test('暂停 lets the round finish, 停止 cancels at once, 继续 goes on', async t => {
@@ -252,6 +395,132 @@ test('past the threshold the run changes conversation, sending the summary with 
   assert.equal(old?.card?.handoff?.status, 'consumed');
   assert.notEqual(old?.id, fresh.id);
   assert.equal(dispatchStatus(harness, projectId, 'd2'), 'done');
+});
+
+test('past the threshold an unfinished dispatch goes on in a new conversation, with the summary and the dispatch', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·接着换对话', [['世界书/人设', '逐个写人物', 'RUN:continue 1 big'], ['世界书/人设', '下一条', 'RUN:deliver 下一条']]);
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => ['paused', 'completed'].includes(status(harness, projectId) ?? ''), 'the run across the handoff', 30_000);
+  const finished = run(harness, projectId)!;
+  assert.equal(finished.status, 'completed', finished.pause?.message);
+  assert.deepEqual(finished.done, ['d1', 'd2']);
+  assert.equal(finished.continued, undefined);
+  const fresh = task(harness, finished.conversations['lore-people']);
+  const first = fresh.messages.find(message => message.role === 'user')!;
+  assert.match(first.text, /已定: 人物模板 v2/);
+  assert.match(first.text, /RUN:continue 1 big/, 'the dispatch goes along with the summary');
+  const old = harness.snapshot().tasks.find(item => item.card?.handoff);
+  assert.equal(old?.card?.handoff?.status, 'consumed');
+  assert.notEqual(old?.id, fresh.id);
+  assert.equal(old!.messages.filter(message => message.role === 'user' && message.text === CONTINUE_TEXT).length, 0, 'the old conversation handed over instead of going on');
+});
+
+// What a failed summary leaves: the dispatch is 进行中 in its old conversation and nothing is running.
+test('after 继续, a dispatch the run was carrying on with is sent on, not dropped from the queue', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·半途', [['世界书/人设', '逐个写人物', 'RUN:deliver 剩下的']]);
+  const d1 = harness.snapshot().cardStudio!.cards.find(item => item.projectId === projectId)!.dispatches[0];
+  const conversation = await studio.startConversation({ projectId, sectionId: 'lore-people', dispatchId: d1.id, title: d1.title, prompt: formatDispatch(d1) });
+  await until(() => settled(harness, conversation.id), 'the first round of the dispatch');
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'active');
+  const at = new Date().toISOString();
+  const sentIds = task(harness, conversation.id).messages.filter(message => message.role === 'user').map(message => message.id);
+  harness.saveCardRun(projectId, { id: 'fixture-run', scope: 'lore', status: 'paused', pause: { reason: 'model-error', message: '没有拿到交接摘要，换对话没有完成。', at }, settings, queue: ['d1'], total: 1, done: [], conversations: { 'lore-people': conversation.id }, sentIds: { [conversation.id]: sentIds }, continued: { dispatchId: 'd1', count: 4 }, autoAnswered: [], startedAt: at, updatedAt: at });
+  await studio.runner.resume(projectId);
+  await until(() => ['paused', 'completed'].includes(status(harness, projectId) ?? ''), 'the run after 继续');
+  assert.deepEqual(run(harness, projectId)?.done, ['d1']);
+  const sent = task(harness, conversation.id).messages.filter(message => message.role === 'user').map(message => message.text);
+  assert.equal(sent.at(-1), CONTINUE_TEXT, 'the conversation goes on with the dispatch instead of getting it again');
+  assert.equal(sent.filter(text => text.includes('RUN:deliver 剩下的')).length, 1);
+});
+
+// A dispatch stopped mid-way stays 进行中 in the section's conversation; the next run has to pick it up, or it is never finished.
+test('a new run picks up a dispatch a stopped run left 进行中 and continues it in its own conversation', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·停了再来', [['世界书/人设', '写甲', 'RUN:hold'], ['世界书/人设', '写乙', 'RUN:deliver 乙']]);
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => { const current = run(harness, projectId)?.current; return !!current && task(harness, current.taskId).status === 'running'; }, 'the held turn');
+  const held = run(harness, projectId)!.current!.taskId;
+  await studio.runner.stop(projectId);
+  await until(() => settled(harness, held) && !studio.runner.owns(held), 'the stopped turn to settle');
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'active', 'the stop left it 进行中');
+  await studio.runner.dismiss(projectId);
+
+  await studio.runner.start(projectId, 'lore', settings);
+  const started = run(harness, projectId)!;
+  assert.deepEqual([started.queue, started.total, started.pickedUp], [['d1', 'd2'], 2, ['d1']], 'both, in planning order, the 进行中 one remembered as picked up');
+  await until(() => status(harness, projectId) === 'completed', 'the second run to complete');
+  const finished = run(harness, projectId)!;
+  assert.deepEqual(finished.done, ['d1', 'd2']);
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'done');
+  assert.equal(dispatchStatus(harness, projectId, 'd2'), 'done');
+  assert.equal(finished.conversations['lore-people'], held, 'the section’s conversation is the one that holds the dispatch');
+  assert.equal(harness.snapshot().tasks.filter(item => item.card?.sectionId === 'lore-people').length, 1, 'no second conversation was opened');
+  const sent = task(harness, held).messages.filter(message => message.role === 'user').map(message => message.text);
+  assert.equal(sent.length, 3);
+  assert.ok(sent[0].includes('RUN:hold'));
+  assert.equal(sent[1], CONTINUE_TEXT, 'the dispatch goes on instead of being sent again');
+  assert.ok(sent[2].includes('RUN:deliver 乙'), 'and the next one follows in the same conversation');
+});
+
+test('a 进行中 dispatch whose conversation is gone starts again cleanly in a new one', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·没了对话', [['世界书/人设', '写甲', 'RUN:deliver 甲'], ['世界书/人设', '写乙', 'RUN:deliver 乙']]);
+  const d1 = harness.snapshot().cardStudio!.cards.find(item => item.projectId === projectId)!.dispatches[0];
+  const gone = await studio.startConversation({ projectId, sectionId: 'lore-people', dispatchId: d1.id, title: d1.title, prompt: formatDispatch(d1) });
+  await until(() => settled(harness, gone.id), 'the first round of the dispatch');
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'active');
+  harness.updateTask(gone.id, { archived: true });
+
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => status(harness, projectId) === 'completed', 'the run to complete');
+  const finished = run(harness, projectId)!;
+  assert.deepEqual(finished.done, ['d1', 'd2']);
+  const fresh = task(harness, finished.conversations['lore-people']);
+  assert.notEqual(fresh.id, gone.id);
+  const sent = fresh.messages.filter(message => message.role === 'user').map(message => message.text);
+  assert.ok(sent[0].includes('RUN:deliver 甲'), 'the dispatch is sent whole, not continued');
+  assert.equal(sent.includes(CONTINUE_TEXT), false);
+  assert.equal(task(harness, gone.id).messages.filter(message => message.role === 'user').length, 1, 'the archived conversation is left alone');
+});
+
+test('a picked-up dispatch whose conversation is past the threshold goes on in a new conversation, with the summary and the dispatch', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·捡起来换对话', [['世界书/人设', '逐个写人物', 'RUN:continue 1 big'], ['世界书/人设', '下一条', 'RUN:deliver 下一条']]);
+  const d1 = harness.snapshot().cardStudio!.cards.find(item => item.projectId === projectId)!.dispatches[0];
+  // A first round that said the dispatch is not finished, with the context nearly full: sent by hand, or by a run that was stopped.
+  const old = await studio.startConversation({ projectId, sectionId: 'lore-people', dispatchId: d1.id, title: d1.title, prompt: formatDispatch(d1) });
+  await until(() => settled(harness, old.id) && !!task(harness, old.id).contextUsage?.tokens, 'the first round');
+  assert.equal(dispatchStatus(harness, projectId, 'd1'), 'active');
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => ['paused', 'completed'].includes(status(harness, projectId) ?? ''), 'the run across the handoff', 30_000);
+  const finished = run(harness, projectId)!;
+  assert.equal(finished.status, 'completed', finished.pause?.message);
+  assert.deepEqual(finished.done, ['d1', 'd2']);
+  const fresh = task(harness, finished.conversations['lore-people']);
+  assert.notEqual(fresh.id, old.id);
+  const first = fresh.messages.find(message => message.role === 'user')!;
+  assert.match(first.text, /已定: 人物模板 v2/);
+  assert.match(first.text, /RUN:continue 1 big/, 'the dispatch goes along with the summary');
+  assert.equal(task(harness, old.id).card?.handoff?.status, 'consumed');
+  assert.equal(task(harness, old.id).messages.filter(message => message.role === 'user' && message.text === CONTINUE_TEXT).length, 0, 'the old conversation handed over instead of going on');
+});
+
+test('a dispatch the user started by hand while the run was paused stays out of the run', async t => {
+  const { root, harness, studio } = await setup(t); cleanup(t, root, harness);
+  const { projectId } = await card(harness, studio, root, '一键·手动发', [['世界书/人设', '写甲', 'RUN:ask'], ['世界书/人设', '写乙', 'RUN:deliver 乙']]);
+  await studio.runner.start(projectId, 'lore', settings);
+  await until(() => status(harness, projectId) === 'paused', 'the question pause');
+  // The user sends the second dispatch to its section by hand, in a conversation of their own.
+  const d2 = harness.snapshot().cardStudio!.cards.find(item => item.projectId === projectId)!.dispatches[1];
+  const byHand = await studio.startConversation({ projectId, sectionId: 'lore-people', dispatchId: d2.id, title: d2.title, prompt: formatDispatch(d2) });
+  await until(() => settled(harness, byHand.id) && dispatchStatus(harness, projectId, 'd2') === 'active', 'the hand-sent dispatch');
+  await studio.runner.resume(projectId);
+  await until(() => status(harness, projectId) === 'completed', 'the run after 继续');
+  assert.deepEqual(run(harness, projectId)?.done, ['d1'], 'the run did not send the dispatch again');
+  assert.equal(dispatchStatus(harness, projectId, 'd2'), 'active', 'it stays the user’s');
+  assert.equal(task(harness, byHand.id).messages.filter(message => message.role === 'user').length, 1);
 });
 
 test('全部开做 runs every board in dispatch order and ends with the assembly check', async t => {

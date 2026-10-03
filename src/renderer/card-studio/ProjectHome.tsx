@@ -85,8 +85,8 @@ export function ProjectHome({ card }: { card: CardProjectView }) {
           <FolderTree size={13} /><span>{t(`${card.unclassified} unclassified entries`, `未分类条目 ${card.unclassified} 条`)}</span><em>· {t('Sort', '整理')}</em><ArrowRight size={13} />
         </button>}
         {card.design.exists && <div className="cs-desk-run">
-          <button type="button" className="cs-btn is-primary" disabled={running || !everything} title={running ? t('A run is in progress.', '一键制作进行中。') : undefined} onClick={() => setRunScope('all')}><Zap size={14} />{t('Run everything', '全部开做')}<small>{t(`${everything} unsent`, `${everything} 条未派`)}</small></button>
-          <span className="cs-note">{t('Sends every unsent world book, script, regex and greeting dispatch in order, then runs the assembly check.', '按顺序代发世界书、脚本、正则、开场白的全部未派派单，最后跑一次拼装检查。')}</span>
+          <button type="button" className="cs-btn is-primary" disabled={running || !everything} title={running ? t('A run is in progress.', '一键制作进行中。') : undefined} onClick={() => setRunScope('all')}><Zap size={14} />{t('Run everything', '全部开做')}<small>{t(`${everything} to do`, `${everything} 条待做`)}</small></button>
+          <span className="cs-note">{t('Sends every unsent or in-progress world book, script, regex and greeting dispatch in order, then runs the assembly check.', '按顺序代发世界书、脚本、正则、开场白里未派的和停在「进行中」的派单，最后跑一次拼装检查。')}</span>
         </div>}
       </header>
       <RunBar card={card} />
@@ -100,7 +100,7 @@ export function ProjectHome({ card }: { card: CardProjectView }) {
           </button>
           {card.design.exists && (RUN_BOARDS as readonly string[]).includes(board.id) && (() => {
             const count = runQueue(card.dispatches, board.id as CardRunScope).length;
-            return <button type="button" className="cs-board-run" disabled={running || !count} onClick={() => setRunScope(board.id as CardRunScope)}><Zap size={12} />{t('One-click making', '一键制作')}<small>{t(`${count} unsent`, `${count} 条未派`)}</small></button>;
+            return <button type="button" className="cs-board-run" disabled={running || !count} onClick={() => setRunScope(board.id as CardRunScope)}><Zap size={12} />{t('One-click making', '一键制作')}<small>{t(`${count} to do`, `${count} 条待做`)}</small></button>;
           })()}
           <ul>{board.sections.map(section => {
             const state = sectionState(input, section.id);

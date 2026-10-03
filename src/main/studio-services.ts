@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Harness } from './harness.ts';
 import type { Task } from '../shared/types.ts';
+import { canonicalRoleKeys } from '../shared/agents.ts';
 import type { AttachmentInfo, CheckDefinition, CheckEvidence, DeliverySummary, LabReport, StudioPreferences, StudioState, TerminalView } from '../shared/studio-types.ts';
 import { AttachmentService, listWorkspace, previewLocalFile, workspacePath } from './attachments.ts';
 import { CheckpointService, type ReviewAction } from '../core/checkpoints.ts';
@@ -17,6 +18,7 @@ import { TerminalService } from './terminal-service.ts';
 import { probeConnection, benchmarkConnection } from './model-lab.ts';
 import { validateAccessRule, ruleMatches } from './access-rules.ts';
 import { UpdateService } from './updates.ts';
+import { APP_VERSION } from '../shared/version.ts';
 
 const defaults: StudioPreferences = { sandboxEnabled: true, defaultSquadSize: 6, teamTokenBudget: 0, teamMinutesBudget: 0, teamMoneyBudget: 0, roleModels: {}, updateFeed: '' };
 const done = (task: Task) => ['idle', 'completed', 'failed', 'cancelled'].includes(task.status);
@@ -33,11 +35,17 @@ export class StudioServices extends EventEmitter {
   constructor(readonly dataDir: string, private harness: Harness, readonly helperPath: string, imageToPng: (buffer: Buffer) => Buffer) {
     super();
     this.attachments = new AttachmentService(dataDir, imageToPng); this.checkpoints = new CheckpointService(dataDir); this.integrations = new SquadIntegrationService(dataDir, { checkpoints: this.checkpoints });
-    this.terminal = new TerminalService(helperPath); this.updates = new UpdateService(dataDir, '1.1.0');
+    this.terminal = new TerminalService(helperPath); this.updates = new UpdateService(dataDir, APP_VERSION);
     let saved: Partial<StudioState> = {};
     try { saved = JSON.parse(readFileSync(join(dataDir, 'studio.json'), 'utf8')); if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw new Error('Invalid studio settings.'); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('Unable to read studio.json. The original file has been preserved for recovery.', { cause: error }); }
-    this.state = { preferences: { ...defaults, ...saved.preferences, roleModels: saved.preferences?.roleModels || {} }, rules: saved.rules || [], projectChecks: saved.projectChecks || {} };
+    // 1.3.0 (§5.1): a 1.2 custom role this load moved to <id>-custom takes its model choice along, before the old built-in ids move.
+    const roleModels = { ...saved.preferences?.roleModels };
+    let moved = false;
+    for (const [from, to] of harness.store.renamedRoles) if (Object.hasOwn(roleModels, from) && !Object.hasOwn(roleModels, to)) { roleModels[to] = roleModels[from]; delete roleModels[from]; moved = true; }
+    this.state = { preferences: { ...defaults, ...saved.preferences, roleModels: canonicalRoleKeys(roleModels) }, rules: saved.rules || [], projectChecks: saved.projectChecks || {} };
+    // Written at once: when the moved role is saved, no later load can tell which choice was its.
+    if (moved) try { this.persist(); } catch { /* Kept for this run; the next settings change writes it. */ }
   }
   snapshot(): StudioState { return structuredClone(this.state); }
   private persist(): void {
@@ -45,10 +53,11 @@ export class StudioServices extends EventEmitter {
     writeFileSync(temporary, JSON.stringify(this.state)); renameSync(temporary, join(this.dataDir, 'studio.json')); this.harness.publishStudio();
   }
   task(id: string): Task { const task = this.harness.store.state.tasks.find(task => task.id === id); if (!task) throw new Error('Task not found.'); return task; }
-  private commandPolicy(task: Task) { const readOnly = !!(task.sharedReadOnly || task.planMode || this.harness.store.state.ecosystem.roles.find(role => role.id === task.role)?.readOnly); return { mode: readOnly || this.state.preferences.sandboxEnabled && task.permission !== 'full' ? 'sandbox' as const : 'host' as const, network: 'off' as const, readOnly }; }
+  private commandPolicy(task: Task) { const role = this.harness.roles(task.projectId).find(item => item.id === task.role); const readOnly = !!(task.readOnly || task.sharedReadOnly || task.planMode || role?.readOnly); return { mode: readOnly || this.state.preferences.sandboxEnabled && task.permission !== 'full' ? 'sandbox' as const : 'host' as const, network: 'off' as const, readOnly }; }
   project(id: string) { const project = this.harness.store.state.projects.find(project => project.id === id); if (!project) throw new Error('Project not found.'); return project; }
   settings(changes: Partial<StudioPreferences>): void {
     const next = { ...this.state.preferences, ...changes };
+    next.roleModels = canonicalRoleKeys(next.roleModels ?? this.state.preferences.roleModels);
     if (typeof next.sandboxEnabled !== 'boolean' || !Number.isInteger(next.defaultSquadSize) || next.defaultSquadSize < 1 || next.defaultSquadSize > 6) throw new Error('Choose 1–6 squad members.');
     for (const value of [next.teamTokenBudget, next.teamMinutesBudget, next.teamMoneyBudget]) if (!Number.isFinite(value) || value < 0) throw new Error('Budgets must be non-negative; zero means no limit.');
     if (next.updateFeed) { const url = new URL(next.updateFeed); if (url.protocol !== 'https:' || url.username || url.password) throw new Error('The update source must use HTTPS.'); }
@@ -68,7 +77,8 @@ export class StudioServices extends EventEmitter {
     if (records.reduce((total, file) => total + file.bytes, 0) > 80 * 1024 * 1024) throw new Error('Combined attachments exceed 80 MB.'); return records;
   }
   async beforeRun(task: Task, turnId: string): Promise<void> {
-    if (task.sharedReadOnly) return;
+    // A card squad member works inside its lead's turn, and the lead's checkpoint covers the whole card folder (spec §6.6).
+    if (task.sharedReadOnly || task.card?.member) return;
     return this.exclusive(task.cwd, () => this.captureRun(task, turnId));
   }
   private async captureRun(task: Task, turnId: string): Promise<void> {
@@ -103,7 +113,13 @@ export class StudioServices extends EventEmitter {
   private async exclusive<T>(cwd: string, run: () => Promise<T>): Promise<T> {
     const key = resolve(cwd).toLowerCase(); const previous = this.directoryLocks.get(key) || Promise.resolve();
     const result = previous.catch(() => undefined).then(run); this.directoryLocks.set(key, result);
-    try { return await result; } finally { if (this.directoryLocks.get(key) === result) this.directoryLocks.delete(key); }
+    try { return await result; } finally {
+      if (this.directoryLocks.get(key) === result) {
+        this.directoryLocks.delete(key);
+        // A task queued while the folder was busy — a squad member behind another's checkpoint — can start now.
+        this.harness.publishStudio(false);
+      }
+    }
   }
   directoryLocked(cwd: string): boolean { return this.directoryLocks.has(resolve(cwd).toLowerCase()); }
   async checkpointDiff(taskId: string, id?: string) {

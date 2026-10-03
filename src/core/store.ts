@@ -6,10 +6,13 @@ import { userInfo } from 'node:os';
 import type { AppSnapshot, Gateway, Preferences, Task } from '../shared/types.ts';
 import { parseHooks } from './hooks-config.ts';
 import { validateAvatars } from './avatar.ts';
-import { defaultEcosystem } from './ecosystem.ts';
+import { BUILTIN_ROLES, defaultEcosystem } from './ecosystem.ts';
+import { canonicalRoleId, savedCustomRoles } from '../shared/agents.ts';
+import { normalizeCardSquad } from '../shared/card-studio/squad.ts';
 import { defaultEffortMap } from '../shared/effort.ts';
 import { gatewayModels, normalizeGatewayModels, resolveGatewayModel } from '../shared/gateway-models.ts';
 import { DEFAULT_MAX_OUTPUT_TOKENS, LEGACY_DEFAULT_MAX_OUTPUT_TOKENS } from '../shared/output-limit.ts';
+import { trafficSettings } from '../shared/gateway-traffic.ts';
 import type { TokenTotals, UsageLedgerDay } from '../shared/usage.ts';
 
 export type StoredState = Pick<AppSnapshot, 'preferences' | 'gateways' | 'projects' | 'tasks' | 'schedules' | 'search' | 'ecosystem' | 'hooks' | 'usageLedger'>;
@@ -22,8 +25,8 @@ export function defaultPreferences(): Preferences {
     name, theme: 'system', language: 'zh', font: 'sans', reducedMotion: false,
     notifications: false, instructions: '', defaultPermission: 'ask', maxConcurrent: 2,
     defaultGatewayId: '', defaultModelId: '', defaultContextWindow: 300000,
-    defaultThinking: 'medium', skillPaths: [], disabledSkillIds: [], disabledAgentIds: [], browserAllowed: [], avatars: {},
-    soundEnabled: false, soundVolume: 40, bootSequence: false, releaseCheck: true,
+    defaultThinking: 'medium', skillPaths: [], disabledSkillIds: [], disabledAgentIds: [], enabledAgentIds: [], browserAllowed: [], avatars: {},
+    soundEnabled: false, soundVolume: 40, bootSequence: false, releaseCheck: true, persona: true,
   };
 }
 
@@ -54,6 +57,8 @@ function withoutCredential(gateway: Gateway, migrated: string[] = []): Gateway {
     id: gateway.id, name: gateway.name, baseUrl: gateway.baseUrl, modelId: gateway.modelId,
     protocol: gateway.protocol, reasoning: gateway.reasoning, contextWindow,
     maxTokens, hasKey: gateway.hasKey, nativeSearch: gateway.nativeSearch, effortMap, adaptiveThinking: gateway.adaptiveThinking, defaultsVersion: 6, pricing: gateway.pricing,
+    // 上游服务商, 每分钟请求上限, retries and 无响应断开, kept when readable (1.3.0 §5.4).
+    ...trafficSettings(gateway),
   };
   safe.models = normalizeGatewayModels({ ...safe, models });
   migrated.push(...labels);
@@ -66,7 +71,8 @@ function validNotice(value: unknown): Preferences['migrationNotice'] {
   return models.length ? { kind: 'output-limit', models } : undefined;
 }
 
-function parseState(value: unknown): StoredState {
+/** `renamedRoles` receives the custom roles this read moved off an id Cardwright now reserves (old id → new id). */
+function parseState(value: unknown, renamedRoles = new Map<string, string>()): StoredState {
   if (!isRecord(value)) throw new Error('Saved application state must be an object.');
   const preferences = value.preferences;
   if (preferences !== undefined && !isRecord(preferences)) throw new Error('Invalid saved preferences.');
@@ -81,8 +87,12 @@ function parseState(value: unknown): StoredState {
     defaultModelId: typeof settings.defaultModelId === 'string' ? settings.defaultModelId : '',
     defaultContextWindow: settings.defaultContextWindow,
     defaultThinking: settings.defaultThinking, skillPaths: settings.skillPaths, disabledSkillIds: Array.isArray(settings.disabledSkillIds) ? settings.disabledSkillIds.filter(id => typeof id === 'string') : [], disabledAgentIds: Array.isArray(settings.disabledAgentIds) ? settings.disabledAgentIds.filter(id => typeof id === 'string') : [], browserAllowed: Array.isArray(settings.browserAllowed) ? settings.browserAllowed.filter(origin => typeof origin === 'string' && /^https?:\/\//.test(origin)).slice(0, 200) : [], avatars: validateAvatars(settings.avatars),
+    // A project folder's subagents the user turned on (Q25); what is not an id is dropped.
+    enabledAgentIds: Array.isArray(settings.enabledAgentIds) ? settings.enabledAgentIds.filter(id => typeof id === 'string').map(id => canonicalRoleId(id)).slice(0, 500) : [],
     soundEnabled: typeof settings.soundEnabled === 'boolean' ? settings.soundEnabled : defaults.soundEnabled,
     soundVolume: Number.isInteger(settings.soundVolume) && settings.soundVolume >= 0 && settings.soundVolume <= 100 ? settings.soundVolume : defaults.soundVolume,
+    // 小绘的性格: absent or unreadable means on (§5.4).
+    persona: typeof settings.persona === 'boolean' ? settings.persona : true,
   };
   const notice = validNotice(settings.migrationNotice);
   if (notice) safePreferences.migrationNotice = notice;
@@ -92,6 +102,9 @@ function parseState(value: unknown): StoredState {
     safePreferences.cardHandoff = { tokens: handoff.tokens as number, windowPercent: handoff.windowPercent as number, ...(handoff.enabled === false ? { enabled: false } : {}) };
   }
   if (typeof settings.developerMode === 'boolean') safePreferences.developerMode = settings.developerMode;
+  // 工坊小队 (spec §5.4): kept when the mode is known; a missing 自行组队 is on, anything else means the default.
+  const squad = normalizeCardSquad(settings.cardSquad);
+  if (squad) safePreferences.cardSquad = squad;
   for (const key of ['notifyFinished', 'notifyApproval', 'bootSequence', 'quietUpgrade', 'releaseCheck'] as const) if (typeof settings[key] === 'boolean') safePreferences[key] = settings[key] as boolean;
   const result: StoredState = {
     preferences: safePreferences, gateways: [], projects: [], tasks: [], schedules: [],
@@ -132,10 +145,18 @@ function parseState(value: unknown): StoredState {
   if (isRecord(value.ecosystem)) {
     const config = value.ecosystem;
     for (const key of ['memoryEnabled', 'cacheEnabled', 'showStatusline', 'compactTools'] as const) if (typeof config[key] === 'boolean') result.ecosystem[key] = config[key];
-    if (Array.isArray(config.roles)) result.ecosystem.roles = config.roles.map(item => {
-      if (!isRecord(item) || typeof item.id !== 'string' || typeof item.prompt !== 'string') throw new Error('Invalid saved agent role.');
-      return { id: item.id, name: String(item.name), prompt: item.prompt, readOnly: item.readOnly === true, builtIn: item.builtIn === true };
-    });
+    if (Array.isArray(config.roles)) {
+      const saved = config.roles.map(item => {
+        if (!isRecord(item) || typeof item.id !== 'string' || typeof item.prompt !== 'string') throw new Error('Invalid saved agent role.');
+        // 说明 (§5.1): a role's description survives a save and a load; the built-in roles take theirs from the app below.
+        const description = typeof item.description === 'string' ? item.description.trim().slice(0, 300) : '';
+        return { id: item.id, name: String(item.name), prompt: item.prompt, readOnly: item.readOnly === true, builtIn: item.builtIn === true, ...(description ? { description } : {}) };
+      });
+      // 1.3.0 (§5.1): the built-in roles are always the app's own executor / explorer / planner; custom roles stay.
+      const custom = savedCustomRoles(saved);
+      result.ecosystem.roles = [...structuredClone(BUILTIN_ROLES), ...custom.roles];
+      for (const [from, to] of custom.renamed) renamedRoles.set(from, to);
+    }
     if (Array.isArray(config.mcpServers)) result.ecosystem.mcpServers = config.mcpServers.map(item => {
       if (!isRecord(item) || typeof item.id !== 'string') throw new Error('Invalid saved MCP server.');
       return { id: item.id, name: String(item.name), enabled: item.enabled === true, transport: item.transport === 'stdio' ? 'stdio' : 'http', command: typeof item.command === 'string' ? item.command : undefined, args: Array.isArray(item.args) ? item.args.map(String) : undefined, url: typeof item.url === 'string' ? item.url : undefined, hasSecrets: item.hasSecrets === true };
@@ -144,6 +165,9 @@ function parseState(value: unknown): StoredState {
   } else if (isRecord(value.search) && !value.search.enabled && !value.search.hasKey && !value.search.baseUrl) {
     result.search = { enabled: true, provider: 'auto', baseUrl: '', hasKey: false };
   }
+  // A role id from before 1.3 reads as its new id; a custom role that moved off a reserved id takes its switch along.
+  const roleId = (id: string) => renamedRoles.get(id) ?? canonicalRoleId(id);
+  safePreferences.disabledAgentIds = [...new Set((safePreferences.disabledAgentIds ?? []).map(roleId))];
   for (const key of ['gateways', 'projects', 'tasks', 'schedules'] as const) {
     const entries = value[key];
     if (entries === undefined) continue;
@@ -161,7 +185,9 @@ function parseState(value: unknown): StoredState {
       if (entries.some(entry => !isRecord(entry) || !Array.isArray(entry.messages) || !Array.isArray(entry.tools))) {
         throw new Error('Invalid saved tasks. The original state file has been preserved.');
       }
-      result.tasks = entries as Task[];
+      // 网络状态 (§5.5) belongs to a request in flight: never written, never read back.
+      result.tasks = (entries as Task[]).map(task => { if (task.net === undefined) return task; const { net: _net, ...rest } = task; return rest; });
+      for (const task of result.tasks) if (typeof task.role === 'string') task.role = roleId(task.role);
     }
   }
   const defaultGateway = result.gateways.find(gateway => gateway.id === safePreferences.defaultGatewayId);
@@ -191,6 +217,8 @@ export class AppStore {
   readonly filePath: string;
   readonly state: StoredState;
   readonly migrationBackup?: string;
+  /** Custom roles this load moved off an id Cardwright now reserves (old id → new id), so studio.json's role models can follow. */
+  readonly renamedRoles: ReadonlyMap<string, string>;
   onSaveError?: (error: Error) => void;
   private saveTimer?: ReturnType<typeof setTimeout>;
   private pendingSave?: Promise<void>;
@@ -215,7 +243,9 @@ export class AppStore {
         throw new Error(`Cannot load ${this.filePath}. The original file has been preserved.`, { cause: error });
       }
     }
-    this.state = parseState(saved);
+    const renamedRoles = new Map<string, string>();
+    this.state = parseState(saved, renamedRoles);
+    this.renamedRoles = renamedRoles;
     if (original !== undefined && (!isRecord(saved) || Number(saved.schemaVersion || 0) < STATE_SCHEMA_VERSION)) {
       const backups = join(this.dataDir, 'backups');
       mkdirSync(backups, { recursive: true, mode: 0o700 });

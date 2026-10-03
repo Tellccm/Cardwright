@@ -19,6 +19,8 @@ function describe(id: string): { label: string; group: PromptGroup } {
   if (id === 'kickoff/refine') return { label: '开场话 · 完善优化卡', group: 'kickoff' };
   const name = id.slice('prompts/'.length, -'.md'.length);
   if (name === '通用规则') return { label: '通用规则', group: 'rules' };
+  // 小队-查资料 / 小队-写组件 / 小队-派发 (spec §6.4–6.5).
+  if (name.startsWith('小队-')) return { label: name.replace('-', ' · '), group: 'squad' };
   return { label: name.replace('-', ' · '), group: name.endsWith('-通用') ? 'board' : 'section' };
 }
 

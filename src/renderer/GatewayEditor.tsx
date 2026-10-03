@@ -9,6 +9,7 @@ import { Field, IconButton, Modal } from './primitives';
 import { thinkingLabel, thinkingLevels } from './effort';
 import { defaultEffortMap } from '../shared/effort';
 import { DEFAULT_MAX_OUTPUT_TOKENS } from '../shared/output-limit';
+import { STALL_SECONDS, validStall } from '../shared/gateway-traffic';
 
 const blankModel = (id: string, name?: string): GatewayModel => ({ id, ...(name && name !== id ? { name } : {}), reasoning: false, effortMap: { ...defaultEffortMap }, contextWindow: 300000, maxTokens: DEFAULT_MAX_OUTPUT_TOKENS });
 
@@ -19,6 +20,8 @@ export function GatewayEditor({ gateway, onClose }: { gateway?: Gateway; onClose
     : { id: crypto.randomUUID(), name: '', baseUrl: '', protocol: 'openai-completions' as Gateway['protocol'], upstream: 'auto' as GatewayUpstream });
   const [rateLimit, setRateLimit] = useState(gateway?.rateLimit ?? { enabled: false, perMinute: 20 });
   const [retries, setRetries] = useState(gateway?.retry?.maxRetries ?? 2);
+  // 无响应断开: whole seconds, kept as typed so that an empty field means off.
+  const [stall, setStall] = useState(gateway?.stall ? String(gateway.stall.seconds) : '');
   const [models, setModels] = useState<GatewayModel[]>(() => gateway ? gatewayModels(gateway).map(model => ({ ...model, effortMap: { ...defaultEffortMap, ...model.effortMap, ultra: 'max' } })) : []);
   const [defaultId, setDefaultId] = useState(gateway?.modelId || '');
   const [selectedId, setSelectedId] = useState(gateway?.modelId || '');
@@ -66,12 +69,14 @@ export function GatewayEditor({ gateway, onClose }: { gateway?: Gateway; onClose
     if (!models.length) { setFormError(t('Add at least one model before saving.', '至少添加一个模型后再保存。')); return; }
     const invalid = models.find(model => model.contextWindow < 1024 || model.contextWindow > 10000000 || model.maxTokens < 1 || model.maxTokens > model.contextWindow);
     if (invalid) { setSelectedId(invalid.id); setFormError(t('Check the context window and output limit for', '请检查此模型的上下文与输出上限：') + ' ' + invalid.id); return; }
+    const stallSeconds = stall.trim() ? Number(stall) : undefined;
+    if (stallSeconds !== undefined && !validStall({ seconds: stallSeconds })) { setFormError(t('Disconnect when silent takes a whole number of seconds from 15 to 300, or leave it empty.', '无响应断开要填 15 到 300 之间的整数秒，或者留空。')); return; }
     setBusy(true);
     const cleaned = models.map(model => { const effortMap = { ...model.effortMap }; if (connection.protocol === 'anthropic-messages' && !model.adaptiveThinking) for (const level of ['xhigh', 'max', 'ultra'] as const) delete effortMap[level]; return { ...model, effortMap }; });
     const selectedDefault = cleaned.find(model => model.id === defaultId) || cleaned[0]; const { id: modelId, name: _modelName, ...capabilities } = selectedDefault;
     // A local service without a key gets the placeholder “local”, which model servers accept and ignore.
     const savedKey = key || (local && !gateway?.hasKey ? 'local' : undefined);
-    const result = await run(async () => { await api.saveGateway({ ...connection, name: connection.name.trim(), baseUrl: connection.baseUrl.trim(), modelId, ...capabilities, models: cleaned, rateLimit, retry: { maxRetries: retries } }, savedKey); return true; }, t('Gateway saved', '网关已保存'));
+    const result = await run(async () => { await api.saveGateway({ ...connection, name: connection.name.trim(), baseUrl: connection.baseUrl.trim(), modelId, ...capabilities, models: cleaned, rateLimit, retry: { maxRetries: retries }, ...(stallSeconds !== undefined ? { stall: { seconds: stallSeconds } } : {}) }, savedKey); return true; }, t('Gateway saved', '网关已保存'));
     setBusy(false); if (result) onClose();
   }
   return <Modal title={gateway ? t('Edit gateway', '编辑网关') : t('Connect a model gateway', '连接模型网关')} onClose={() => { if (!busy) onClose(); }} className="gateway-modal gateway-multi-modal">
@@ -101,6 +106,9 @@ export function GatewayEditor({ gateway, onClose }: { gateway?: Gateway; onClose
         </Field>}
         <Field label={t('Retries after a failed request', '请求失败后的重试次数')} hint={t('Applies to timeouts, rate limits and server errors. When the service answers 429, the whole gateway pauses for as long as it asks.', '适用于超时、限流和服务器错误。服务器回 429 时，整个网关按它给的时间一起暂停。')}>
           <input type="number" min={0} max={10} value={retries} onChange={event => setRetries(Math.max(0, Math.min(10, Number(event.target.value) || 0)))} />
+        </Field>
+        <Field label={t('Disconnect when silent (seconds)', '无响应断开（秒）')} hint={t('Empty means off. A model that thinks for a long time without streaming any output can be mistaken for a stall.', '留空为关。模型长时间思考、没有输出时，可能被误判为卡住。')}>
+          <input type="number" min={STALL_SECONDS.min} max={STALL_SECONDS.max} step={1} value={stall} placeholder={t('Off', '关')} onChange={event => { setStall(event.target.value); setFormError(''); }} />
         </Field>
       </details>
       <section className="gateway-model-section" aria-label={t('Gateway models', '网关模型')}>

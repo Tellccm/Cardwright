@@ -6,6 +6,7 @@ import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { WorkerRuntime } from '../src/runtime/worker.ts';
 import type { FromWorker, WorkerInit } from '../src/shared/types.ts';
+import { BUILTIN_ROLES, defaultEcosystem } from '../src/core/ecosystem.ts';
 
 function respond(response: ServerResponse, text = 'Finished.', tool?: { name: string; args: Record<string, unknown> }, usage = { prompt_tokens: 120, completion_tokens: 24, total_tokens: 144 }) {
   response.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -36,29 +37,66 @@ async function fixture(handler: (body: Record<string, unknown>, response: Server
 
 async function until(predicate: () => boolean) { const end = Date.now() + 15000; while (!predicate()) { if (Date.now() > end) throw new Error('Fixture timed out'); await new Promise(resolve => setTimeout(resolve, 10)); } }
 const userEntries = (messages: FromWorker[]) => messages.filter(message => message.type === 'event' && message.event.type === 'session_entry' && message.event.role === 'user').map(message => { assert.equal(message.type, 'event'); return message.event; });
+/** The system prompt of a recorded request: its first message, whatever role the protocol gives it. */
+const systemPrompt = (body: Record<string, unknown>) => String((body.messages as Array<{ content: unknown }>)[0].content);
 
-test('worker injects Cardwright identity and sends max for default Ultra into the real request', { timeout: 30000 }, async () => {
+test('the request opens with 小绘 and the configured model, and the default Ultra sends max', { timeout: 30000 }, async () => {
   const f = await fixture((_body, response) => respond(response));
   try {
     const worker = f.newWorker(); await worker.handle(f.init); await worker.handle({ type: 'prompt', text: 'Which model are you?', messageId: 'user-identity' });
     assert.equal(f.bodies.length, 1, JSON.stringify(f.messages));
     assert.equal(f.bodies[0].reasoning_effort, 'max');
+    const system = systemPrompt(f.bodies[0]);
+    assert.ok(system.startsWith('你是小绘，Cardwright 里的 AI。这次对话用的模型是 configured-model（网关：Fixture gateway）。'), system.slice(0, 120));
+    assert.ok(system.includes('跟用户说话时，你是这样的：'));
+    assert.doesNotMatch(system, /desktop coding assistant|When asked your model/);
     const payload = JSON.stringify(f.bodies[0]);
-    assert.match(payload, /configured-model/); assert.match(payload, /configured model ID/); assert.match(payload, /Cardwright, a desktop coding assistant/);
     assert.doesNotMatch(payload, /operating inside pi|Pi documentation|fixture-private-key/);
-    assert.doesNotMatch(payload, /ULTRA TEAM MODE|"name":"agent_team"/);
+    assert.doesNotMatch(payload, /ULTRA TEAM MODE|"name":"dispatch_team"/);
     assert.ok(f.messages.some(item => item.type === 'event' && item.event.type === 'thinking_level_changed' && item.event.level === 'ultra' && item.event.runtimeLevel === 'max'));
     const entries = userEntries(f.messages); assert.equal(entries.length, 1); assert.equal(entries[0].messageId, 'user-identity');
     const done = f.messages.findLast(item => item.type === 'done'); assert.ok(done?.type === 'done'); assert.ok(done.sessionLeafId); assert.equal(done.userEntries?.[0].entryId, entries[0].entryId);
   } finally { await f.close(); }
 });
 
+test('a squad member gets one line; the personality follows its switch and the interface language', { timeout: 30000 }, async () => {
+  const f = await fixture((_body, response) => respond(response));
+  try {
+    const systemOf = async (identity: WorkerInit['identity']) => {
+      const worker = f.newWorker(); await worker.handle({ ...f.init, identity }); await worker.handle({ type: 'prompt', text: 'Who are you?' });
+      return systemPrompt(f.bodies.at(-1)!);
+    };
+    const member = await systemOf({ language: 'zh', persona: true, member: true });
+    assert.ok(member.startsWith('你是小绘派出的帮手，这次用的模型是 configured-model（网关：Fixture gateway）。'), member.slice(0, 80));
+    assert.doesNotMatch(member, /你是小绘，|跟用户说话时/);
+    const plain = await systemOf({ language: 'zh', persona: false, member: false });
+    assert.ok(plain.startsWith('你是小绘，Cardwright 里的 AI。'));
+    assert.doesNotMatch(plain, /跟用户说话时/);
+    const english = await systemOf({ language: 'en', persona: true, member: false });
+    assert.ok(english.startsWith('You are 小绘, the AI in Cardwright. This conversation runs on configured-model (gateway: Fixture gateway).'), english.slice(0, 120));
+    assert.ok(english.includes('When you talk with the user:'));
+  } finally { await f.close(); }
+});
+
+test('a memory review is a bare request: no system prompt, no 小绘', { timeout: 30000 }, async () => {
+  const f = await fixture((_body, response) => respond(response, '{"memories":[],"archiveIds":[]}'));
+  try {
+    const worker = f.newWorker();
+    await worker.handle({ ...f.init, dataDir: join(f.root, 'data'), projectId: 'dream-project', ecosystem: { ...defaultEcosystem(), memoryEnabled: true } });
+    await worker.handle({ type: 'prompt', text: '/dream', messageId: 'dream' });
+    assert.equal(f.messages.some(item => item.type === 'error'), false, JSON.stringify(f.messages.filter(item => item.type === 'error')));
+    assert.equal(f.bodies.length, 1);
+    assert.deepEqual((f.bodies[0].messages as Array<{ role: string }>).map(message => message.role), ['user']);
+    assert.doesNotMatch(JSON.stringify(f.bodies[0]), /小绘|Cardwright 里的 AI/);
+  } finally { await f.close(); }
+});
+
 test('Ultra lead automatically collects late members and synthesizes once in the same visible turn', { timeout: 30000 }, async () => {
   let calls = 0;
-  const members = [{ name: '界面匠', prompt: 'Review layout.' }, { name: '验收员', prompt: 'Review cases.' }];
+  const members = [{ name: '界面匠', task: 'Review layout.' }, { name: '验收员', task: 'Review cases.' }];
   const f = await fixture((_body, response) => {
     const call = calls++;
-    if (call === 0 || call === 2) respond(response, '', { name: 'agent_team', args: { members } });
+    if (call === 0 || call === 2) respond(response, '', { name: 'dispatch_team', args: { members } });
     else respond(response, call === 1 ? 'My own part is finished.' : 'The complete squad result is synthesized.');
   });
   try {
@@ -141,10 +179,10 @@ test('automatic compaction triggers above 90 percent and publishes unknown conte
 
 test('Ultra lead creates a named squad, waits for results, and keeps plan members read-only', { timeout: 30000 }, async () => {
   let calls = 0;
-  const members = [{ name: '界面匠', prompt: 'Review the layout.', role: 'general-purpose' }, { name: '验收员', prompt: 'Check acceptance cases.', role: 'Explore' }];
+  const members = [{ name: '界面匠', task: 'Review the layout.', role: 'executor' }, { name: '验收员', task: 'Check acceptance cases.', role: 'explorer' }];
   const f = await fixture((_body, response) => {
-    if (calls++ === 0) respond(response, '', { name: 'agent_team', args: { members } });
-    else if (calls === 2) respond(response, '', { name: 'get_subagent_result', args: { wait: true } });
+    if (calls++ === 0) respond(response, '', { name: 'dispatch_team', args: { members } });
+    else if (calls === 2) respond(response, '', { name: 'member_result', args: { wait: true } });
     else respond(response, 'Both members returned; plan synthesized.');
   });
   try {
@@ -152,7 +190,8 @@ test('Ultra lead creates a named squad, waits for results, and keeps plan member
     const run = worker.handle({ type: 'prompt', text: 'Plan a UI update and independent acceptance review.', messageId: 'team-turn' });
     await until(() => f.messages.some(item => item.type === 'request' && item.method === 'team'));
     const team = f.messages.find(item => item.type === 'request' && item.method === 'team'); assert.ok(team?.type === 'request');
-    assert.deepEqual(team.args.members, members.map(member => ({ ...member, role: 'Explore' })));
+    assert.deepEqual(team.args.members, members.map(member => ({ name: member.name, prompt: member.task, role: member.role })), 'the host request keeps its own field names, and each member the subagent it was sent as');
+    assert.equal(team.args.readOnly, true, 'a planning lead’s members only read: the request says so and the app decides');
     assert.equal(f.messages.some(item => item.type === 'request' && item.method === 'approve'), false);
     await worker.handle({ type: 'response', id: team.id, result: { members: [{ id: 'child-ui', name: '界面匠' }, { id: 'child-review', name: '验收员' }] } });
     await until(() => f.messages.some(item => item.type === 'request' && item.method === 'wait'));
@@ -170,7 +209,7 @@ test('Ultra lead creates a named squad, waits for results, and keeps plan member
 
 test('squad schema rejects a single member before the host can create children', { timeout: 30000 }, async () => {
   let calls = 0;
-  const f = await fixture((_body, response) => respond(response, 'Handled invalid squad.', calls++ === 0 ? { name: 'agent_team', args: { members: [{ name: '验收员', prompt: 'Review it.' }] } } : undefined));
+  const f = await fixture((_body, response) => respond(response, 'Handled invalid squad.', calls++ === 0 ? { name: 'dispatch_team', args: { members: [{ name: '验收员', task: 'Review it.' }] } } : undefined));
   try {
     const worker = f.newWorker(); await worker.handle({ ...f.init, canDelegate: true }); await worker.handle({ type: 'prompt', text: 'Exercise squad validation.' });
     assert.equal(f.messages.some(item => item.type === 'request' && item.method === 'team'), false);
@@ -222,5 +261,52 @@ test('effective local skills are automatically readable, disabled skills absent,
     assert.match(JSON.stringify(f.bodies.at(-1)), /MANUAL_SKILL_CONTENT/);
     const before = f.bodies.length; await worker.handle({ type: 'prompt', text: '/skill:disabled-fixture', messageId: 'disabled-user' });
     assert.equal(f.bodies.length, before); assert.ok(f.messages.some(item => item.type === 'error' && /unavailable or disabled/.test(item.message)));
+  } finally { await f.close(); }
+});
+
+test('a built-in role is named by its new id in the task mode', { timeout: 30000 }, async () => {
+  const f = await fixture((_body, response) => respond(response));
+  try {
+    const worker = f.newWorker(); await worker.handle({ ...f.init, roleDefinition: BUILTIN_ROLES.find(role => role.id === 'explorer') });
+    await worker.handle({ type: 'prompt', text: 'Look around.' });
+    const payload = JSON.stringify(f.bodies[0]);
+    assert.match(payload, /Role: explorer\. Inspect the project and return findings; do not change files\./);
+    assert.doesNotMatch(payload, /Role: Explore/);
+  } finally { await f.close(); }
+});
+
+test('a read-only task that is asked to write points the model at an executor task', { timeout: 30000 }, async () => {
+  let calls = 0;
+  const f = await fixture((_body, response) => respond(response, 'Refused.', calls++ === 0 ? { name: 'write', args: { path: 'refused.txt', content: 'x' } } : undefined));
+  try {
+    const worker = f.newWorker(); await worker.handle({ ...f.init, roleDefinition: BUILTIN_ROLES.find(role => role.id === 'explorer') });
+    await worker.handle({ type: 'prompt', text: 'Write a file.' });
+    assert.equal(f.bodies.length, 2, JSON.stringify(f.messages));
+    const refusal = JSON.stringify(f.bodies[1]);
+    assert.match(refusal, /This task is read-only\. Approve the implementation plan or use an executor task before making changes\./);
+    assert.doesNotMatch(refusal, /general-purpose/);
+  } finally { await f.close(); }
+});
+
+test('the squad tools carry Cardwright’s names and list the roles one per line; message_member reaches the member', { timeout: 30000 }, async () => {
+  let calls = 0;
+  const f = await fixture((_body, response) => calls++ === 0
+    ? respond(response, '', { name: 'message_member', args: { member_id: 'child-1', message: '再查一下第三章。' } })
+    : respond(response, 'Sent.'));
+  try {
+    const worker = f.newWorker(); await worker.handle({ ...f.init, canDelegate: true });
+    const run = worker.handle({ type: 'prompt', text: 'Tell the member to look again.', messageId: 'steer-turn' });
+    await until(() => f.messages.some(item => item.type === 'request' && item.method === 'steer_agent'));
+    const steer = f.messages.find(item => item.type === 'request' && item.method === 'steer_agent'); assert.ok(steer?.type === 'request');
+    assert.deepEqual(steer.args, { agent_id: 'child-1', message: '再查一下第三章。' }, 'the host request keeps its own field names');
+    await worker.handle({ type: 'response', id: steer.id, result: { ok: true } });
+    await run;
+    const tools = JSON.stringify(f.bodies[0].tools);
+    for (const name of ['dispatch_member', 'dispatch_team', 'member_result', 'message_member']) assert.match(tools, new RegExp(`"name":"${name}"`));
+    for (const old of ['agent', 'agent_team', 'get_subagent_result', 'steer_subagent']) assert.doesNotMatch(tools, new RegExp(`"name":"${old}"`));
+    assert.match(tools, /- `executor`（执行员）：通用执行/);
+    assert.match(tools, /- `explorer`（探索员）：查看项目、交回发现；只读/);
+    assert.match(tools, /- `planner`（规划师）：规划，进入规划模式；只读/);
+    assert.doesNotMatch(tools, /subagent_type|run_in_background|general-purpose/);
   } finally { await f.close(); }
 });

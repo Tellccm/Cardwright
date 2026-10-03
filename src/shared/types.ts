@@ -1,5 +1,6 @@
 import type { AttachmentInfo, DeliverySummary, ModelPricing, StudioBridge, StudioState } from './studio-types.ts';
 import type { AppUpdate } from './app-updates.ts';
+import type { RoleSummary } from './agents.ts';
 import type { RendererErrorReport } from './diagnostics.ts';
 import type { HooksConfig } from '../core/hooks-config.ts';
 import type { ThemeDefinition } from './themes.ts';
@@ -9,7 +10,7 @@ import type { UsageLedgerDay } from './usage.ts';
 import type { VariableRow } from './card-studio/variable-table.ts';
 import type { RequestDiagnostic } from '../runtime/request-log.ts';
 import type { AssembledJailbreak, JailbreakChoice, JailbreakPack, JailbreakPackSummary, PresetImportEntry } from './jailbreak.ts';
-import type { CardChange, NewCardChange, CardRun, CardRunScope, CardRunSettings, CardSettings, CardSettingsChange, PromptOverrideDetail, PromptOverrideItem, CardMeta, CardPieceImport, CardPreview, CardPreviewKind, CardPieceSummary, CardCheckReport, CardComponentResult, CardComponentSummary, CardExportResult, CardImportPreview, CardImportReport, CardLoreSuggestion, CardProjectView, CardStudioSnapshot, CardTaskInfo, CardVariableTableView, CardVariableTableEdit, CardVariableSyncResult, CoverSource, NewCardComponent, NewCardProject, PlanMode, SourceImportReport, SourceRecord, StartCardConversation } from './card-studio/types.ts';
+import type { CardChange, NewCardChange, CardRun, CardRunScope, CardRunSettings, CardSettings, CardSettingsChange, CardSquadAssignment, CardSquadSettings, PromptOverrideDetail, PromptOverrideItem, CardMeta, CardPieceImport, CardPreview, CardPreviewKind, CardPieceSummary, CardCheckReport, CardComponentResult, CardComponentSummary, CardExportResult, CardImportPreview, CardImportReport, CardLoreSuggestion, CardProjectView, CardStudioSnapshot, CardTaskInfo, CardVariableTableView, CardVariableTableEdit, CardVariableSyncResult, CoverSource, NewCardComponent, NewCardProject, PlanMode, SourceImportReport, SourceRecord, StartCardConversation } from './card-studio/types.ts';
 export type PermissionMode = 'ask' | 'edit' | 'full';
 export type TaskStatus = 'idle' | 'queued' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled';
 export type ThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -28,6 +29,8 @@ export interface Gateway {
   rateLimit?: { enabled: boolean; perMinute: number };
   /** How many times a failed request is retried before the run fails. */
   retry?: { maxRetries: number };
+  /** 无响应断开: a request that receives nothing for this many seconds is cut off and retried; whole seconds 15–300, absent is off. */
+  stall?: { seconds: number };
   reasoning: boolean; contextWindow: number; maxTokens: number; hasKey: boolean;
   nativeSearch?: { enabled: boolean; responsesUrl?: string };
   effortMap?: Partial<Record<ThinkingLevel, string | null>>; adaptiveThinking?: boolean;
@@ -45,6 +48,8 @@ export interface Preferences {
   disabledSkillIds?: string[];
   /** Subagents the user switched off, built-in, saved or discovered. */
   disabledAgentIds?: string[];
+  /** A project folder's subagents the user turned on; they start off (Q25). */
+  enabledAgentIds?: string[];
   /** Origins the built-in browser may open without asking again (§6.4). */
   browserAllowed?: string[];
   avatars?: { user?: string; assistant?: string };
@@ -62,10 +67,14 @@ export interface Preferences {
   cardHandoff?: { tokens: number; windowPercent: number; enabled?: boolean };
   /** Card studio: shows and edits the built-in prompts (提示词覆盖). */
   developerMode?: boolean;
+  /** 工坊小队 (spec §5.4): the 子代理 switch and 自行组队; absent means off, with 自行组队 on. */
+  cardSquad?: CardSquadSettings;
   /** 桌宠: off by default; the pet, when none is chosen, is the theme's; where its floating window was dragged to. */
   petEnabled?: boolean; petId?: string; petPosition?: { x: number; y: number };
   /** 新版本提醒 (1.1): once a day the version number of the latest GitHub release; on unless false. */
   releaseCheck?: boolean;
+  /** 小绘的性格 (1.3.0 §4.5): on unless false. Her name and the honest answer about the model stay either way. */
+  persona?: boolean;
 }
 /** 一键自检 of a gateway: the model list, then one completion of a single token; each step on its own. */
 export interface GatewaySelfTest { ok: boolean; steps: Array<{ step: 'models' | 'completion'; ok: boolean; detail: string; ms: number }> }
@@ -86,7 +95,7 @@ export interface AgentRole {
   id: string; name: string; prompt: string; readOnly: boolean; builtIn?: boolean;
   /** Where this subagent comes from; absent on the roles saved before 0.9. */
   source?: 'builtin' | 'custom' | 'project' | 'user';
-  /** Discovered subagents carry their own description, file and declared tools; Cardwright only reads the tools to tell read-only ones apart. */
+  /** 说明: a discovered subagent's front-matter description, or the one line the user wrote for their own (stage 3). Discovered ones also carry their file and declared tools; Cardwright only reads the tools to tell read-only ones apart. */
   description?: string; path?: string; tools?: string[]; model?: string; projectId?: string;
   enabled?: boolean;
   /** Another subagent of the same name takes precedence. */
@@ -98,7 +107,7 @@ export interface MemoryItem { id: string; content: string; category?: string; so
 export interface BackupPreview { files: string[]; bytes: number; createdAt: string; excludes: string[] }
 export interface Project { id: string; name: string; path: string; isGit: boolean; createdAt: string; collapsed?: boolean; pinned?: boolean; /** Card studio projects appear only in the card library. */ kind?: 'card'; cardSettings?: CardSettings; /** The card's 一键制作 / 全部开做 run, if any. */ cardRun?: CardRun }
 export interface Usage { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number }
-export interface ChatMessage { id: string; role: 'user' | 'assistant' | 'system'; text: string; thinking?: string; /** When the thinking began, moved on by earlier thinking time when the model thinks again, so now minus this is the total while it thinks. */ thinkingStartedAt?: string; /** How long the model thought, set once it stops thinking. */ thinkingMs?: number; at: string; usage?: Usage; model?: string; turnId?: string; sessionEntryId?: string; pending?: boolean; attachments?: AttachmentInfo[]; /** The card dispatch this message started; 撤回 sends it back to 未派. */ dispatchId?: string }
+export interface ChatMessage { id: string; role: 'user' | 'assistant' | 'system'; text: string; thinking?: string; /** When the thinking began, moved on by earlier thinking time when the model thinks again, so now minus this is the total while it thinks. */ thinkingStartedAt?: string; /** How long the model thought, set once it stops thinking. */ thinkingMs?: number; at: string; usage?: Usage; model?: string; turnId?: string; sessionEntryId?: string; pending?: boolean; attachments?: AttachmentInfo[]; /** The card dispatch this message started; 撤回 sends it back to 未派. */ dispatchId?: string; /** A card squad member's message: the lead turn that sent it, where the work it starts counts (spec §6.6). */ leadTurnId?: string }
 export interface ToolCall { id: string; toolCallId?: string; name: string; args: Record<string, unknown>; output: string; status: 'running' | 'waiting' | 'completed' | 'failed'; patch?: string; at: string; search?: SearchOutput; turnId?: string }
 /** A phase of a long conversation, marked by the agent (§6.3). */
 export interface TaskChapter { id: string; title: string; turnId: string; at: string }
@@ -118,6 +127,12 @@ export interface Task {
   agentName?: string; squadId?: string; assignedTask?: string; sharedReadOnly?: boolean;
   /** A squad member writing in its lead's folder because no separate Git worktree is available. */
   sharedWorkspace?: boolean;
+  /**
+   * May not write, decided once when the task was made (stage 3), whatever definition its subagent's name resolves to: a member
+   * its lead sent read-only, a task whose subagent only reads (explorer and planner whichever file answers to the name), the
+   * Dreamer. Nothing upgrades a member's; only approving a top-level task's plan, which makes it an executor, ends one.
+   */
+  readOnly?: boolean;
   workerActive?: boolean; activationCount?: number; startedAt?: string; completedAt?: string;
   contextUsage?: { tokens: number | null; window: number; percent: number | null }; contextCompacting?: boolean;
   delivery?: DeliverySummary; checkpointIds?: string[]; cachePrefix?: Record<string, unknown>;
@@ -129,6 +144,11 @@ export interface Task {
   jailbreak?: JailbreakChoice;
   /** 请求诊断: the shape of the last model request, kept so a gateway refusal can be read. */
   lastRequest?: RequestDiagnostic;
+  /**
+   * 网络状态 (1.3.0 §5.5): 排队 (每分钟请求上限), 冷却 (429) or 重试 (第 attempt/max 次), with `until` in ms since the
+   * epoch. Cleared when the request goes out or ends; never saved.
+   */
+  net?: { state: 'queued' | 'cooldown' | 'retrying'; until?: number; attempt?: number; max?: number };
 }
 export interface Approval { id: string; taskId: string; toolName: string; args: Record<string, unknown>; reason: string; createdAt: string }
 export interface Schedule {
@@ -166,7 +186,7 @@ export interface NewTask {
   scheduleId?: string;
   modelId?: string; contextWindow?: number;
   role?: string; planMode?: boolean;
-  agentName?: string; squadId?: string; sharedReadOnly?: boolean; sharedWorkspace?: boolean;
+  agentName?: string; squadId?: string; sharedReadOnly?: boolean; sharedWorkspace?: boolean; readOnly?: boolean;
   attachments?: string[];
   card?: CardTaskInfo;
   /** 破限: the pack a new workbench task starts with. */
@@ -358,10 +378,14 @@ export interface WorkerInit {
   sessionFile?: string; gateway: Gateway; apiKey: string; thinking: ThinkingLevel;
   permission: PermissionMode; instructions: string; skillPaths: string[];
   canDelegate: boolean;
+  /** The subagents this task's lead may dispatch, already filtered for its project (stage 3); the dispatch tools list them. */
+  roles?: RoleSummary[];
   search?: SearchConfig & { apiKey?: string };
   projectId?: string; dataDir?: string; ecosystem?: EcosystemConfig;
   mcpServers?: Array<McpServerConfig & { env?: Record<string, string>; headers?: Record<string, string> }>;
   role?: string; roleDefinition?: AgentRole; planMode?: boolean; todos?: TodoItem[];
+  /** Decided by the app when the task was made (stage 3); the worker never lifts it, whatever its subagent says. */
+  readOnly?: boolean;
   skillFiles?: SkillInfo[]; sessionLeafId?: string | null; branchBeforeEntryId?: string;
   sandbox?: { enabled: boolean; helperPath?: string }; attachmentRoot?: string;
   fileCheckpoints?: boolean;
@@ -369,14 +393,18 @@ export interface WorkerInit {
   networkOrigins?: string[];
   /** A squad member sharing its lead's folder with other writing members. */
   sharedWorkspace?: boolean;
-  /** Card studio section conversations: the assembled section prompt and read-only built-in resources. */
-  card?: { prompt: string; readRoots: string[] };
+  /** Card studio section conversations: the assembled section prompt and read-only built-in resources; `member` for a squad member: its kind and the files it may write (spec §6.2–6.3); `addDispatches` offers card_add_dispatches (planning that starts or refines a card, §5.6). */
+  card?: { prompt: string; readRoots: string[]; member?: CardSquadAssignment; addDispatches?: boolean };
   /** True when the user has PreToolUse or PostToolUse hooks; the worker then asks the app about each tool call. */
   hooks?: boolean;
   /** Workbench tasks get the built-in browser; card studio conversations do not. */
   browser?: boolean;
   /** 破限, already resolved and with its macros expanded; absent means the toggle is off. */
   jailbreak?: AssembledJailbreak;
+  /** The desktop process answers `rate-slot` requests for this worker: 每分钟请求上限 and 网关冷却 hold its model requests. Every desktop task sets it. */
+  rateSlots?: boolean;
+  /** 小绘 (ADR 0022): the identity text's language, whether her personality is on, and whether this run is a squad member; absent means zh, on, lead. */
+  identity?: { language: 'zh' | 'en'; persona: boolean; member: boolean };
 }
 export type ToWorker = WorkerInit | { type: 'prompt'; text: string; behavior?: 'steer' | 'followUp'; messageId?: string; attachments?: Array<AttachmentInfo & { storedPath: string }> }
   | { type: 'cancel' } | { type: 'permission'; permission: PermissionMode }

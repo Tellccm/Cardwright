@@ -4,6 +4,7 @@ import type { AgentRole, BackupPreview, McpServerConfig, MemoryItem } from '../s
 import { useApp } from './context';
 import { Empty, Field, IconButton, Modal, Row, Toggle } from './primitives';
 import { HookSettings } from './HookSettings';
+import { readsOnly, replacesReadOnlyBuiltIn, roleDescription, roleKey } from '../shared/agents';
 
 type EcosystemPage = 'preferences' | 'memory' | 'mcp' | 'roles' | 'hooks' | 'backup';
 
@@ -111,16 +112,23 @@ function RoleSettings() {
     : role.source === 'user' ? t('You · .claude/agents', '用户 · .claude/agents')
     : role.builtIn ? t('Built-in', '内置') : t('Your own', '自建');
   const shadow = (role: AgentRole) => data.ecosystem.roles.find(item => item.id === role.shadowedBy);
-  return <><div className="section-heading"><div><h3>{t('Subagents', '子代理')}</h3><p>{t('Pick one when you start a task or send a parallel agent. Cardwright also reads the agents in ~/.claude/agents and each project’s .claude/agents.', '新建任务或派并行 Agent 时可以选一个。Cardwright 也会读取 ~/.claude/agents 和每个项目的 .claude/agents 里的子代理。')}</p></div><button className="button small" onClick={() => setEditing('new')}><Plus size={15} />{t('Add subagent', '添加子代理')}</button></div>
-    <div className="ecosystem-config-list">{data.ecosystem.roles.map(role => <article key={role.id} className={role.enabled === false || role.shadowedBy ? 'is-off' : ''}><Users size={18} /><div>
-      <h4>{role.name}<span className="badge">{sourceLabel(role)}</span>{role.readOnly && <span className="badge">{t('Read only', '只读')}</span>}{role.model && <span className="badge">{role.model}</span>}</h4>
-      <p>{role.description || role.prompt}</p>
+  // A project's own subagent, once on, takes the place of the same-named built-in, saved or user one in that project.
+  const replaces = (role: AgentRole) => role.source === 'project' && role.enabled !== false
+    ? data.ecosystem.roles.find(item => !item.projectId && item.enabled !== false && roleKey(item) === roleKey(role)) : undefined;
+  return <><div className="section-heading"><div><h3>{t('Subagents', '子代理')}</h3><p>{t('Pick one when you start a task; the lead can also send them as members. Cardwright reads .claude/agents and .agents/agents in your home folder (on) and in each project (off until you turn them on).', '新建任务时可以选一个，主代理也会按需派成员。Cardwright 还会读用户目录和每个项目里的 .claude/agents、.agents/agents：用户目录里的默认打开，项目里带的默认关闭。')}</p></div><button className="button small" onClick={() => setEditing('new')}><Plus size={15} />{t('Add subagent', '添加子代理')}</button></div>
+    <div className="ecosystem-config-list">{data.ecosystem.roles.map(role => { const replaced = replaces(role); return <article key={role.id} className={role.enabled === false || role.shadowedBy ? 'is-off' : ''}><Users size={18} /><div>
+      <h4>{role.name}<span className="badge">{sourceLabel(role)}</span>{readsOnly(role) && <span className="badge">{t('Read only', '只读')}</span>}</h4>
+      <p>{roleDescription(role)}</p>
       {role.path && <small className="agent-path" title={role.path}>{role.path}{role.tools?.length ? ` · ${t('tools', '工具')}: ${role.tools.join(', ')}` : ''}</small>}
+      {role.model && <small className="agent-note">{t(`The model in the file (${role.model}) is not used. Pick one under Workbench & verification › Squad budgets and models.`, `文件里的 model（${role.model}）不起作用，模型在「工作台与验证 › 小队预算与模型」里选。`)}</small>}
+      {role.source === 'project' && role.enabled === false && <small className="agent-note">{t('Subagents that come with a project start off. Turn one on once you trust its file.', '项目里带的子代理默认关闭，确认内容可信再打开。')}</small>}
+      {replaced && <small className="agent-warning">{t(`In this project it takes the place of “${replaced.name}”.`, `在这个项目里，它会顶替同名的「${replaced.name}」。`)}</small>}
+      {replacesReadOnlyBuiltIn(role) && <small className="agent-note">{t('A file of the same name only swaps the description and instructions; the explorer and planner always only read.', '同名文件只换说明和指令，探索员／规划师始终只读。')}</small>}
       {role.shadowedBy && <small className="agent-shadow">{t(`Another subagent of this name takes precedence: ${shadow(role)?.name ?? role.shadowedBy}`, `同名子代理优先：${shadow(role)?.name ?? role.shadowedBy}`)}</small>}
     </div><div className="ecosystem-row-actions">
       <Toggle label={`${t('Enable', '启用')} ${role.name}`} checked={role.enabled !== false} onChange={enabled => void run(() => api.setAgentEnabled(role.id, enabled))} />
       {!role.builtIn && !role.source?.match(/project|user/) && <><IconButton label={`${t('Edit', '编辑')} ${role.name}`} onClick={() => setEditing(role)}><Pencil size={15} /></IconButton><IconButton label={`${t('Remove', '移除')} ${role.name}`} onClick={() => setRemoving(role)}><Trash2 size={15} /></IconButton></>}
-    </div></article>)}</div>
+    </div></article>; })}</div>
     {editing && <RoleEditor role={editing === 'new' ? undefined : editing} onClose={() => setEditing(null)} />}
     {removing && <Modal title={t('Remove this subagent?', '移除这个子代理？')} onClose={() => setRemoving(null)} className="small-modal"><p className="modal-intro">{removing.name}</p><div className="modal-actions"><button className="button" onClick={() => setRemoving(null)}>{t('Cancel', '取消')}</button><button className="button danger" onClick={() => void run(async () => { await api.removeAgentRole(removing.id); setRemoving(null); })}>{t('Remove subagent', '移除子代理')}</button></div></Modal>}
   </>;
@@ -128,9 +136,9 @@ function RoleSettings() {
 
 function RoleEditor({ role, onClose }: { role?: AgentRole; onClose: () => void }) {
   const { api, t, run } = useApp();
-  const [value, setValue] = useState<AgentRole>(role || { id: '', name: '', prompt: '', readOnly: false });
+  const [value, setValue] = useState<AgentRole>(role || { id: '', name: '', prompt: '', readOnly: false, description: '' });
   const [busy, setBusy] = useState(false);
-  return <Modal title={role ? t('Edit subagent', '编辑子代理') : t('Add subagent', '添加子代理')} onClose={() => { if (!busy) onClose(); }} className="gateway-modal"><form onSubmit={event => { event.preventDefault(); setBusy(true); void run(async () => { await api.saveAgentRole({ ...value, id: value.id.trim(), name: value.name.trim(), prompt: value.prompt.trim() }); return true; }).then(result => { setBusy(false); if (result) onClose(); }); }}><div className="form-grid"><Field label={t('Role ID', '角色 ID')} hint={t('Stable lowercase identifier, e.g. reviewer.', '稳定的小写标识，例如 reviewer。')}><input autoFocus={!role} required disabled={!!role} pattern="[a-z0-9][a-z0-9-]*" value={value.id} onChange={event => setValue({ ...value, id: event.target.value })} /></Field><Field label={t('Display name', '显示名称')}><input autoFocus={!!role} required value={value.name} onChange={event => setValue({ ...value, name: event.target.value })} /></Field></div><Field label={t('Role instructions', '角色指令')}><textarea required rows={7} value={value.prompt} onChange={event => setValue({ ...value, prompt: event.target.value })} /></Field><label className="checkbox-row"><input type="checkbox" checked={value.readOnly} onChange={event => setValue({ ...value, readOnly: event.target.checked })} /><span>{t('Read-only role', '只读角色')}<small>{t('Restrict the agent to inspection and analysis.', '将此 Agent 限定为检查和分析。')}</small></span></label><div className="modal-actions"><button type="button" className="button" disabled={busy} onClick={onClose}>{t('Cancel', '取消')}</button><button className="button primary" disabled={busy}>{busy ? t('Saving…', '保存中…') : t('Save subagent', '保存子代理')}</button></div></form></Modal>;
+  return <Modal title={role ? t('Edit subagent', '编辑子代理') : t('Add subagent', '添加子代理')} onClose={() => { if (!busy) onClose(); }} className="gateway-modal"><form onSubmit={event => { event.preventDefault(); setBusy(true); void run(async () => { await api.saveAgentRole({ ...value, id: value.id.trim(), name: value.name.trim(), prompt: value.prompt.trim(), description: value.description?.trim() || undefined }); return true; }).then(result => { setBusy(false); if (result) onClose(); }); }}><div className="form-grid"><Field label={t('Role ID', '角色 ID')} hint={t('Stable lowercase identifier, e.g. reviewer.', '稳定的小写标识，例如 reviewer。')}><input autoFocus={!role} required disabled={!!role} pattern="[a-zA-Z0-9][a-zA-Z0-9_\-]{0,63}" value={value.id} onChange={event => setValue({ ...value, id: event.target.value })} /></Field><Field label={t('Display name', '显示名称')}><input autoFocus={!!role} required value={value.name} onChange={event => setValue({ ...value, name: event.target.value })} /></Field></div><Field label={t('Description', '说明')} hint={t('One line on what it does; the lead reads it when it picks a member. Left empty, the first line of the instructions is used.', '一句话说明它做什么，主代理派成员时看这个；不填就用指令的第一行。')}><input value={value.description ?? ''} maxLength={300} placeholder={t('For example: reviews changes and lists risks', '例如：审查改动，列出风险')} onChange={event => setValue({ ...value, description: event.target.value })} /></Field><Field label={t('Role instructions', '角色指令')}><textarea required rows={7} value={value.prompt} onChange={event => setValue({ ...value, prompt: event.target.value })} /></Field><label className="checkbox-row"><input type="checkbox" checked={value.readOnly} onChange={event => setValue({ ...value, readOnly: event.target.checked })} /><span>{t('Read-only role', '只读角色')}<small>{t('Restrict the agent to inspection and analysis.', '将此 Agent 限定为检查和分析。')}</small></span></label><div className="modal-actions"><button type="button" className="button" disabled={busy} onClick={onClose}>{t('Cancel', '取消')}</button><button className="button primary" disabled={busy}>{busy ? t('Saving…', '保存中…') : t('Save subagent', '保存子代理')}</button></div></form></Modal>;
 }
 
 function WebdavSettings() {

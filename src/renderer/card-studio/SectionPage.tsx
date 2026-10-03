@@ -168,7 +168,6 @@ export function SectionPage({ card, sectionId, conversation }: { card: CardProje
   const refused = !card.design.exists && !NO_DESIGN_OK.includes(sectionId) && !own.some(dispatch => dispatch.changeId);
   const language = data.preferences.language;
   const choice = useKickoffChoice(card, !conversationsOf(data.tasks, card.projectId, 'plan').length);
-  const squad = sectionId === 'plan' && selected ? data.tasks.filter(item => item.parentId === selected.id) : [];
 
   async function kickoff(mode: PlanMode) {
     if (starting) return;
@@ -282,7 +281,6 @@ export function SectionPage({ card, sectionId, conversation }: { card: CardProje
           <p className="cs-note">{card.dispatches.length ? t(`${dispatchCounts(card.dispatches).done} of ${card.dispatches.length} done`, `${dispatchCounts(card.dispatches).done} / ${card.dispatches.length} 已完成`) : t('Planning writes dispatches once the design book is agreed.', '设计书达成共识后，规划会写出派单。')}</p>
         </section>
         <section><h3>{t('Start planning', '开始规划')}</h3>{kickoffButtons}</section>
-        {squad.length > 0 && <section><h3>{t('Reading squad', '读资料小队')}<em className="cs-count">{squad.length}</em></h3><ol className="cs-squad">{squad.map(member => <li key={member.id}><b>{member.agentName || member.title}</b><em>{['running', 'queued', 'waiting'].includes(member.status) || member.workerActive ? t('Reading', '读资料中') : member.status === 'completed' ? t('Back', '已归队') : member.status === 'failed' ? t('Failed', '失败') : t('Stopped', '已停止')}</em></li>)}</ol></section>}
       </> : sectionId === 'source' ? <section>
         <h3>{t('About material', '关于资料')}</h3>
         <p className="cs-note">{t('Section AIs read the design book and the material index first, then read only the chapters a task needs.', '分区 AI 开工时先读设计书和资料索引，再按任务精读相关章节，不整本通读。')}</p>

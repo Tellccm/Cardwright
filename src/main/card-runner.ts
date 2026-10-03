@@ -5,14 +5,18 @@ import type { CardStudioService } from './card-studio.ts';
 import { formatDispatch } from '../shared/card-studio/dispatch.ts';
 import { ACCEPT_ALL_TEXT } from '../shared/card-studio/markers.ts';
 import { DEFAULT_HANDOFF, handoffThreshold } from '../shared/card-studio/handoff.ts';
-import { CONTINUE_TEXT, RUN_PAUSE_LABELS, changeQueue, dispatchErrors, runIsOpen, runQueue, turnOutcome } from '../shared/card-studio/run.ts';
-import type { CardCheckFinding, CardRun, CardRunPause, CardRunScope, CardRunSettings } from '../shared/card-studio/types.ts';
+import { CONTINUE_LIMIT, CONTINUE_TEXT, RUN_PAUSE_LABELS, carriedOn, changeQueue, dispatchErrors, runIsOpen, runQueue, turnOutcome } from '../shared/card-studio/run.ts';
+import { squadOf, squadTools } from '../shared/card-studio/view.ts';
+import type { CardCheckFinding, CardDispatch, CardRun, CardRunPause, CardRunScope, CardRunSettings } from '../shared/card-studio/types.ts';
 import type { Approval, ChatMessage, Interaction, Project, Task } from '../shared/types.ts';
 
 const ACTIVE = new Set(['queued', 'running', 'waiting']);
 const SCOPES = new Set<CardRunScope>(['all', 'lore', 'script', 'regex', 'greet', 'change']);
 const LEVELS = new Set(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 const stamp = () => new Date().toISOString();
+
+/** What the pause says when 自动按推荐 has answered one dispatch CONTINUE_LIMIT times and the section AI still asks. */
+const answerLimitMessage = (question: string) => `已经自动按推荐答了 ${CONTINUE_LIMIT} 次，分区 AI 还在提问，先停在这里。\n\n${question}`;
 
 /** The message that asks for one fix round on this dispatch's check errors. */
 function fixPrompt(errors: CardCheckFinding[]): string {
@@ -74,7 +78,9 @@ export class CardRunner extends EventEmitter {
       if (!queue.length) throw new Error('没有未派的派单可做。');
       const chosen: CardRunSettings = { thinking: settings.thinking, gatewayId: settings.gatewayId, ...(settings.modelId ? { modelId: settings.modelId } : {}), permission: settings.permission, autoAnswer: settings.autoAnswer };
       this.harness.saveCardSettings(projectId, { run: chosen });
-      const run: CardRun = { id: randomUUID(), scope, ...(options.changeId ? { changeId: options.changeId } : {}), status: 'running', settings: chosen, queue, total: queue.length, done: [], conversations: {}, autoAnswered: [], startedAt: stamp(), updatedAt: stamp() };
+      // A dispatch a stopped run left 进行中 is queued with the unsent ones, in planning order; this run goes on with it where it stopped.
+      const pickedUp = view.dispatches.filter(item => item.status === 'active' && queue.includes(item.id)).map(item => item.id);
+      const run: CardRun = { id: randomUUID(), scope, ...(options.changeId ? { changeId: options.changeId } : {}), status: 'running', settings: chosen, queue, total: queue.length, ...(pickedUp.length ? { pickedUp } : {}), done: [], conversations: {}, autoAnswered: [], startedAt: stamp(), updatedAt: stamp() };
       this.save(projectId, run);
       void this.advance(projectId);
       return structuredClone(run);
@@ -96,7 +102,8 @@ export class CardRunner extends EventEmitter {
    * 继续: messages the user sent meanwhile count as handled and the last turn is judged again. Without any, the run does
    * what the pause was waiting for: it takes the recommendations for a question, allows another fix round for check
    * errors, asks again for a summary that never came, and asks the conversation to go on after an error, a restart, a
-   * stopped turn, a refusal or failing tools.
+   * stopped turn, a refusal, failing tools or gaps the squad left. A dispatch the run carries on with gets
+   * CONTINUE_LIMIT automatic rounds again.
    */
   resume(projectId: string): Promise<void> {
     return this.exclusive(projectId, async () => {
@@ -105,6 +112,8 @@ export class CardRunner extends EventEmitter {
       const previous = structuredClone(run);
       const reason = run.pause?.reason;
       run.status = 'running'; delete run.pause;
+      // 继续 is the user looking: a dispatch the run carries on with gets CONTINUE_LIMIT automatic rounds again.
+      if (run.continued) run.continued = { ...run.continued, count: 0 };
       if (run.handoff) {
         const from = this.task(run.handoff.fromTaskId);
         if (from?.card?.handoff?.status !== 'ready' && !(from && ACTIVE.has(from.status))) {
@@ -128,7 +137,7 @@ export class CardRunner extends EventEmitter {
       const current = run.current && this.task(run.current.taskId);
       let nudge: string | undefined;
       if (run.current && current && !wrote && !ACTIVE.has(current.status)) {
-        if (current.status === 'failed' || current.status === 'cancelled' || reason === 'refusal' || reason === 'tool-failures') nudge = CONTINUE_TEXT;
+        if (current.status === 'failed' || current.status === 'cancelled' || reason === 'refusal' || reason === 'tool-failures' || reason === 'incomplete') nudge = CONTINUE_TEXT;
         else if (reason === 'question') nudge = ACCEPT_ALL_TEXT;
         else if (reason === 'check-errors') run.current.stage = 'work';
       }
@@ -208,7 +217,7 @@ export class CardRunner extends EventEmitter {
       if (run.status === 'pausing') { this.halt(projectId, run, 'user', '已在这一轮结束后暂停。'); return; }
       const dispatch = (await this.studio.reload(projectId)).dispatches.find(item => item.id === run.handoff!.dispatchId);
       delete run.handoff;
-      if (dispatch?.sectionId && dispatch.status === 'todo') {
+      if (dispatch?.sectionId && (dispatch.status === 'todo' || carriedOn(run, dispatch))) {
         const task = await this.studio.startConversation({ projectId, sectionId: dispatch.sectionId, dispatchId: dispatch.id, title: dispatch.title, prompt: `${state.summary}\n\n${formatDispatch(dispatch)}`, ...this.conversationSettings(run) });
         await this.studio.consumeHandoff(from.id);
         run.conversations[dispatch.sectionId] = task.id;
@@ -231,15 +240,19 @@ export class CardRunner extends EventEmitter {
         if (outcome.kind === 'interjection') { this.halt(projectId, run, 'interjection', '你在对话里发了消息，这一轮已经处理。看过后点【继续】接着做。'); return; }
         if (outcome.kind === 'tool-failures') { this.halt(projectId, run, 'tool-failures', `${outcome.tool} 连续失败了 ${outcome.count} 次。看过对话后点【继续】。`); return; }
         if (outcome.kind === 'refusal') { this.halt(projectId, run, 'refusal', outcome.text); return; }
+        if (outcome.kind === 'incomplete') { this.halt(projectId, run, 'incomplete', outcome.text); return; }
         if (outcome.kind === 'question') {
           if (!run.settings.autoAnswer) { this.halt(projectId, run, 'question', outcome.text); return; }
+          if (this.answeredEnough(run)) { this.halt(projectId, run, 'question', answerLimitMessage(outcome.text)); return; }
           run.autoAnswered.push({ dispatchId: run.current.dispatchId, text: outcome.text });
           if (run.status === 'pausing') { this.halt(projectId, run, 'user', '已在这一轮结束后暂停。'); return; }
           await this.send(projectId, run, task.id, ACCEPT_ALL_TEXT);
           return;
         }
         const report = await this.studio.runChecks(projectId);
-        const errors = dispatchErrors(report, task.tools, run.current.sent, project.path);
+        // What the squad wrote during these turns is the dispatch's work too (spec §6.6).
+        const squad = squadTools(task, squadOf(this.harness.store.state.tasks, task.id), run.current.sent);
+        const errors = dispatchErrors(report, [...task.tools, ...squad], run.current.sent, project.path);
         if (errors.length) {
           const list = errors.slice(0, 8).map(finding => `${finding.message}${finding.path ? `（${finding.path}）` : ''}`).join('\n');
           if (run.current.stage === 'fix') { this.halt(projectId, run, 'check-errors', `修过一轮仍有错误：\n${list}`); return; }
@@ -248,9 +261,12 @@ export class CardRunner extends EventEmitter {
           await this.send(projectId, run, task.id, fixPrompt(errors));
           return;
         }
+        // 分批写 (ADR 0024): a reply that says the dispatch is not finished goes on with it; nothing is marked done.
+        // Unless the user marked it done meanwhile: then it is finished, and the run moves on to the next one.
+        if (outcome.kind === 'continue' && await this.carryOn(projectId, run, task)) return;
         const done = run.current.dispatchId;
         await this.studio.markDispatchDone(projectId, done);
-        run.done.push(done); run.queue = run.queue.filter(id => id !== done); delete run.current;
+        run.done.push(done); run.queue = run.queue.filter(id => id !== done); delete run.current; delete run.continued;
         this.save(projectId, run);
       }
     }
@@ -259,8 +275,16 @@ export class CardRunner extends EventEmitter {
     const view = await this.studio.reload(projectId);
     while (run.queue.length) {
       const dispatch = view.dispatches.find(item => item.id === run.queue[0]);
-      if (!dispatch?.sectionId || dispatch.status !== 'todo') { run.queue.shift(); continue; }
-      const existing = run.conversations[dispatch.sectionId] ? this.task(run.conversations[dispatch.sectionId]) : undefined;
+      // A dispatch the run was carrying on with is already 进行中; it goes on rather than out of the queue.
+      const carrying = !!dispatch && carriedOn(run, dispatch);
+      if (!dispatch?.sectionId || (dispatch.status !== 'todo' && !carrying)) { run.queue.shift(); continue; }
+      let existing = run.conversations[dispatch.sectionId] ? this.task(run.conversations[dispatch.sectionId]) : undefined;
+      // A dispatch an earlier run left 进行中 goes on in the conversation that holds it, which then is the run's conversation in its section.
+      // With none left, `existing` stays as it is and the dispatch starts again in a new conversation, sent whole.
+      if (carrying && run.pickedUp?.includes(dispatch.id)) {
+        const holder = this.holderOf(projectId, dispatch);
+        if (holder && holder.id !== existing?.id) { existing = holder; run.conversations[dispatch.sectionId] = holder.id; }
+      }
       if (existing && !existing.archived) {
         // The user can write in the moment between two dispatches, and may even have a round of their own going.
         if (this.strays(run, existing).length) {
@@ -269,16 +293,14 @@ export class CardRunner extends EventEmitter {
         }
         // A round of the user's own that 继续 already acknowledged: wait for it, `settled` comes back here.
         if (ACTIVE.has(existing.status) || existing.workerActive) return;
-        const threshold = handoffThreshold(existing.contextWindow || existing.contextUsage?.window || 0, this.harness.store.state.preferences.cardHandoff ?? DEFAULT_HANDOFF);
-        const used = existing.contextUsage?.tokens ?? 0;
-        if (used > 0 && used >= threshold) {
+        if (this.pastThreshold(existing)) {
           run.handoff = { fromTaskId: existing.id, dispatchId: dispatch.id };
           this.save(projectId, run);
           await this.studio.requestHandoff(existing.id, { auto: true });
           return;
         }
         run.current = { dispatchId: dispatch.id, taskId: existing.id, stage: 'work', sent: [] };
-        await this.send(projectId, run, existing.id, formatDispatch(dispatch));
+        await this.send(projectId, run, existing.id, carrying ? CONTINUE_TEXT : formatDispatch(dispatch));
         return;
       }
       const task = await this.studio.startConversation({ projectId, sectionId: dispatch.sectionId, dispatchId: dispatch.id, title: dispatch.title, prompt: formatDispatch(dispatch), ...this.conversationSettings(run) });
@@ -312,6 +334,7 @@ export class CardRunner extends EventEmitter {
     if (!run || (run.status !== 'running' && run.status !== 'pausing') || run.current?.taskId !== interaction.taskId) return;
     const text = [interaction.title, ...(interaction.questions ?? []).map(question => question.question)].join('\n').slice(0, 1200);
     if (!run.settings.autoAnswer) { this.halt(projectId, run, 'question', text); return; }
+    if (this.answeredEnough(run)) { this.halt(projectId, run, 'question', answerLimitMessage(text)); return; }
     const recommended = (options: Array<{ label: string; description?: string }> | undefined) => options?.find(option => /推荐/.test(`${option.label} ${option.description ?? ''}`))?.label ?? options?.[0]?.label ?? '按推荐';
     const answer = interaction.type === 'confirm' ? true
       : interaction.type === 'select' ? interaction.options?.find(option => option.includes('推荐')) ?? interaction.options?.[0] ?? '按推荐'
@@ -328,6 +351,56 @@ export class CardRunner extends EventEmitter {
     this.save(projectId, run);
     this.followChange(projectId, run, 'paused', `${RUN_PAUSE_LABELS[reason].zh}：${message}`);
     this.emit('notify', { title: this.say(`One-click making paused: ${RUN_PAUSE_LABELS[reason].en}`, `一键制作已暂停：${RUN_PAUSE_LABELS[reason].zh}`), body: `${this.project(projectId).name}：${message.split('\n')[0].slice(0, 120)}` });
+  }
+
+  /**
+   * 分批写 (ADR 0024): the section AI wrote part of its dispatch and said so. The same conversation goes on with the same
+   * dispatch, which stays unfinished. A pause asked for meanwhile comes first, and after CONTINUE_LIMIT automatic rounds
+   * without the user pressing 继续 the run pauses, so a model that never says it is finished cannot run up requests.
+   * Returns false, having sent nothing, when the user marked the dispatch done while the run was paused on it: there is
+   * nothing left to carry on, and the caller finishes it like any delivered dispatch.
+   */
+  private async carryOn(projectId: string, run: CardRun, task: Task): Promise<boolean> {
+    const current = run.current!;
+    if (run.status === 'pausing') { this.halt(projectId, run, 'user', '已在这一轮结束后暂停。'); return true; }
+    if ((await this.studio.reload(projectId)).dispatches.find(item => item.id === current.dispatchId)?.status === 'done') return false;
+    const count = run.continued && run.continued.dispatchId === current.dispatchId ? run.continued.count : 0;
+    if (count >= CONTINUE_LIMIT) { this.halt(projectId, run, 'continue-limit', '为了不一直自动接着做下去，先停在这里。看过对话里写到哪了，点【继续】接着做。'); return true; }
+    run.continued = { dispatchId: current.dispatchId, count: count + 1 };
+    // What the next rounds write is new: it gets a fix round of its own.
+    current.stage = 'work';
+    if (this.pastThreshold(task)) {
+      // The rest goes to a new conversation with the summary and the dispatch, the way the next dispatch would.
+      run.handoff = { fromTaskId: task.id, dispatchId: current.dispatchId };
+      delete run.current;
+      this.save(projectId, run);
+      await this.studio.requestHandoff(task.id, { auto: true });
+      return true;
+    }
+    await this.send(projectId, run, task.id, CONTINUE_TEXT);
+    return true;
+  }
+
+  /**
+   * Whether 自动按推荐 has answered the dispatch in hand as often as the run goes on by itself with one dispatch (CONTINUE_LIMIT,
+   * the same as the automatic 继续): a section AI that keeps asking would be answered for ever, request after request.
+   */
+  private answeredEnough(run: CardRun): boolean {
+    return run.autoAnswered.filter(item => item.dispatchId === run.current?.dispatchId).length >= CONTINUE_LIMIT;
+  }
+
+  /** The conversation a 进行中 dispatch was sent in: the newest one in its section that holds it and is still there (not archived, not a squad member's or the change AI's). */
+  private holderOf(projectId: string, dispatch: CardDispatch): Task | undefined {
+    return this.harness.store.state.tasks
+      .filter(task => task.projectId === projectId && !!task.card && !task.card.member && !task.card.changeId && !task.archived && task.card.sectionId === dispatch.sectionId && task.card.dispatchId === dispatch.id)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+  }
+
+  /** Whether a conversation's context reached the 换对话 threshold set in the studio settings. */
+  private pastThreshold(task: Task): boolean {
+    const threshold = handoffThreshold(task.contextWindow || task.contextUsage?.window || 0, this.harness.store.state.preferences.cardHandoff ?? DEFAULT_HANDOFF);
+    const used = task.contextUsage?.tokens ?? 0;
+    return used > 0 && used >= threshold;
   }
 
   private async send(projectId: string, run: CardRun, taskId: string, text: string): Promise<void> {

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { conversationsOf, dispatchDone, markableDispatch, nextDispatch, progressInputOf, projectRelativePath, relativeTime, runningConversation, turnWrites } from '../src/shared/card-studio/view.ts';
-import type { AppSnapshot, Task, ToolCall } from '../src/shared/types.ts';
+import { conversationsOf, dispatchDone, leadTurnWrites, markableDispatch, memberSummary, memberWrites, membersOfTurn, nextDispatch, progressInputOf, projectRelativePath, relativeTime, runningConversation, squadOf, squadTools, turnAt, turnWrites } from '../src/shared/card-studio/view.ts';
+import type { AppSnapshot, ChatMessage, Task, ToolCall } from '../src/shared/types.ts';
 import type { CardDispatch, CardProjectView } from '../src/shared/card-studio/types.ts';
 
 // Calendar words (昨天, 9月2日) depend on the local time zone; pin it so the test is stable on any machine.
@@ -49,6 +49,83 @@ test('groups the completed file writes of one turn by component', () => {
 const task = (id: string, sectionId: string, extra: Partial<Task> = {}): Task => ({
   id, projectId: 'p1', title: id, cwd: 'E:\\Cards\\西游', status: 'completed', permission: 'edit', gatewayId: 'g', thinking: 'medium',
   createdAt: `2026-09-17T0${id.length}:00:00.000Z`, updatedAt: '2026-09-17T09:00:00.000Z', messages: [], tools: [], card: { sectionId }, ...extra,
+});
+
+test('a member’s work belongs to the lead turn that was running, under the member’s name', () => {
+  const messages: ChatMessage[] = [
+    { id: 'u1', role: 'user', text: '写三个人物', at: '2026-09-17T06:00:00.000Z', turnId: 'u1' },
+    { id: 'a1', role: 'assistant', text: '派了小队。', at: '2026-09-17T06:05:00.000Z', turnId: 'u1' },
+    { id: 'u2', role: 'user', text: '再写一个', at: '2026-09-17T07:00:00.000Z', turnId: 'u2' },
+  ];
+  const lead = task('lead', 'lore-people', { messages, tools: [tool('edit', '设计书.md', 'u1')] });
+  const writer = task('m1', 'lore-people', { parentId: 'lead', agentName: '白骨精', createdAt: '2026-09-17T06:01:00.000Z', card: { sectionId: 'lore-people', member: true, squad: { role: 'writer', files: [], create: ['黄袍怪'] } }, tools: [
+    tool('write', '世界书/人设/130-黄袍怪.md', 'm1-turn', { at: '2026-09-17T06:02:00.000Z' }),
+    tool('write', '世界书/人设/131-奎木狼.md', 'm1-turn', { at: '2026-09-17T07:01:00.000Z' }),
+  ] });
+  const reader = task('m2', 'lore-people', { parentId: 'lead', agentName: '土地公', createdAt: '2026-09-17T06:01:30.000Z', card: { sectionId: 'lore-people', member: true } });
+  const other = task('x', 'lore-people', { parentId: 'someone-else', card: { sectionId: 'lore-people', member: true } });
+  assert.deepEqual(squadOf([lead, writer, reader, other], 'lead').map(item => item.id), ['m1', 'm2']);
+  assert.equal(turnAt(lead, '2026-09-17T06:30:00.000Z'), 'u1');
+  assert.equal(turnAt(lead, '2026-09-17T05:00:00.000Z'), undefined);
+  assert.deepEqual(membersOfTurn(lead, [reader, writer], 'u1').map(item => item.id), ['m1', 'm2']);
+  assert.deepEqual(squadTools(lead, [writer], ['u1']).map(item => [item.turnId, item.memberName, item.args.path]), [['u1', '写组件 · 白骨精', '世界书/人设/130-黄袍怪.md']]);
+  assert.deepEqual(leadTurnWrites(lead, [lead, writer, reader], 'u1', 'E:\\Cards\\西游'), [
+    { name: '设计书', op: 'edit', paths: ['设计书.md'] },
+    { name: '人设·黄袍怪', op: 'write', paths: ['世界书/人设/130-黄袍怪.md'], member: '写组件 · 白骨精' },
+  ]);
+  assert.deepEqual(leadTurnWrites(lead, [lead, writer], 'u2', 'E:\\Cards\\西游').map(item => item.name), ['人设·奎木狼']);
+});
+
+test('a member’s work stays with the lead turn that sent it: a withdrawn turn takes its squad along, and a member sent again works for the later turn', () => {
+  // The lead's u2 (07:00) was withdrawn; u3 (08:00) sent 白骨精 again. Each member message records the lead turn that sent it.
+  const lead = task('lead', 'lore-people', { messages: [
+    { id: 'u1', role: 'user', text: '写人物', at: '2026-09-17T06:00:00.000Z', turnId: 'u1' },
+    { id: 'a1', role: 'assistant', text: '派了小队。', at: '2026-09-17T06:05:00.000Z', turnId: 'u1' },
+    { id: 'u3', role: 'user', text: '让白骨精再补一个', at: '2026-09-17T08:00:00.000Z', turnId: 'u3' },
+  ] });
+  const writer = (id: string, name: string, createdAt: string, extra: Partial<Task>) => task(id, 'lore-people', { parentId: 'lead', agentName: name, createdAt, card: { sectionId: 'lore-people', member: true, squad: { role: 'writer', files: [], create: [name] } }, ...extra });
+  const sentAgain = writer('m1', '白骨精', '2026-09-17T06:01:00.000Z', {
+    messages: [
+      { id: 'm1a', role: 'user', text: '写黄袍怪', at: '2026-09-17T06:01:00.000Z', turnId: 'm1a', leadTurnId: 'u1' },
+      { id: 'm1b', role: 'user', text: '再写白骨精', at: '2026-09-17T08:01:00.000Z', turnId: 'm1b', leadTurnId: 'u3' },
+    ],
+    tools: [tool('write', '世界书/人设/130-黄袍怪.md', 'm1a', { at: '2026-09-17T06:02:00.000Z' }), tool('write', '世界书/人设/132-白骨精.md', 'm1b', { at: '2026-09-17T08:02:00.000Z' })],
+  });
+  const fromWithdrawn = writer('m2', '黄袍怪', '2026-09-17T07:01:00.000Z', {
+    messages: [{ id: 'm2a', role: 'user', text: '写奎木狼', at: '2026-09-17T07:01:00.000Z', turnId: 'm2a', leadTurnId: 'u2' }],
+    tools: [tool('write', '世界书/人设/131-奎木狼.md', 'm2a', { at: '2026-09-17T07:02:00.000Z' })],
+  });
+  const tasks = [lead, sentAgain, fromWithdrawn];
+  assert.deepEqual(membersOfTurn(lead, [fromWithdrawn, sentAgain], 'u1').map(item => item.id), ['m1'], 'the withdrawn turn’s member does not move to the turn before it');
+  assert.deepEqual(membersOfTurn(lead, [fromWithdrawn, sentAgain], 'u3'), [], 'a member’s card stays in the turn that started it');
+  assert.deepEqual(leadTurnWrites(lead, tasks, 'u1', 'E:\\Cards\\西游').map(item => [item.name, item.member]), [['人设·黄袍怪', '写组件 · 白骨精']]);
+  assert.deepEqual(leadTurnWrites(lead, tasks, 'u3', 'E:\\Cards\\西游').map(item => [item.name, item.member]), [['人设·白骨精', '写组件 · 白骨精']]);
+  assert.deepEqual(squadTools(lead, [fromWithdrawn]).map(item => item.turnId), ['u2'], 'still the turn that sent it');
+});
+
+test('a member card shows what the member wrote and a short version of what it returned', () => {
+  const member = task('m1', 'lore-people', { tools: [
+    tool('write', '世界书/人设/130-黄袍怪.md', 'm1'), tool('edit', '世界书/人设/130-黄袍怪.md', 'm1'), tool('read', '资料/索引.md', 'm1'), tool('write', '世界书/人设/131-x.md', 'm1', { status: 'failed' }),
+  ], messages: [{ id: 'a', role: 'assistant', text: `黄袍怪写好了。\n<!-- cardwright:incomplete -->`, at: '2026-09-17T06:00:00.000Z' }] });
+  assert.deepEqual(memberWrites(member, 'E:\\Cards\\西游'), [{ name: '人设·黄袍怪', op: 'edit', paths: ['世界书/人设/130-黄袍怪.md'] }]);
+  assert.equal(memberSummary(member), '黄袍怪写好了。');
+  assert.equal(memberSummary({ messages: [{ id: 'b', role: 'assistant', text: '长'.repeat(500), at: '' }] }).length, 401);
+  assert.equal(memberSummary({ messages: [] }), '');
+});
+
+test('a member card’s summary is its last reply with words in it, and its writes are its own whatever turn it worked in', () => {
+  const messages: ChatMessage[] = [
+    { id: 'u1', role: 'user', text: '写黄袍怪', at: '2026-09-17T06:00:00.000Z', turnId: 'u1' },
+    { id: 'a1', role: 'assistant', text: '先读资料。', at: '2026-09-17T06:01:00.000Z', turnId: 'u1' },
+    { id: 'a2', role: 'assistant', text: '黄袍怪写好了，两处引用了出处。\n<!-- cardwright:refuse -->', at: '2026-09-17T06:02:00.000Z', turnId: 'u1' },
+    { id: 'u2', role: 'user', text: '再补一句', at: '2026-09-17T06:03:00.000Z', turnId: 'u2' },
+    { id: 'a3', role: 'assistant', text: '   ', at: '2026-09-17T06:04:00.000Z', turnId: 'u2' },
+  ];
+  assert.equal(memberSummary({ messages }), '黄袍怪写好了，两处引用了出处。', 'the empty reply after it and the user’s message are skipped, and the marker line is hidden');
+  const member = task('m1', 'lore-people', { tools: [
+    tool('write', '世界书/人设/130-黄袍怪.md', 'u1'), tool('write', '世界书/人设/131-奎木狼.md', 'u2'), tool('write', 'E:\\elsewhere.txt', 'u2'),
+  ] });
+  assert.deepEqual(memberWrites(member, 'E:\\Cards\\西游').map(item => item.name), ['人设·黄袍怪', '人设·奎木狼'], 'both of its turns count, and a path outside the card does not');
 });
 
 test('lists a section conversations newest first and finds the running conversation of a card', () => {
